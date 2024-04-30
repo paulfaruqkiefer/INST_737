@@ -1,0 +1,2087 @@
+---
+title: "Foreclosure Data Analysis"
+author: "Jasper Evans, Krehl Kasayan, Paul Kiefer, Pablo Suarez"
+date: "2024-20-2024"
+output: html_document
+---
+
+# Prince George's County Maryland Foreclosure Analysis
+
+We will use Prince George's County's foreclosure dataset as the core of our project (https://data.princegeorgescountymd.gov/Urban-Planning/County-Foreclosures/mnie-hrv7/about_data). The dataset is maintained by the Prince George's County planning department and lists foreclosures by address between 2009 and 2024. The dataset has imperfections, including some apparent duplicate records.
+
+## Data Setup
+
+Load libraries.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen=999)
+##install.packages("ggrepel")
+##install.packages('ggthemes')
+##install.packages('gplots')
+#install.packages('car')
+##install.packages("glmnet")
+library(tidyverse)
+library(dplyr)
+#Necessary for date parsing.
+library(lubridate)
+#Necessary for column name cleaning.
+library(janitor)
+#Eventually necessary for visualization
+library(ggthemes)
+#Necessary for Census API calls.
+library(tidycensus)
+#Eventually necessary for visualizations.
+library(ggplot2)
+library(gplots)
+#Potentially necessary for cleaning.
+library(ggrepel)
+#Eventually necessary for visualizations.
+library(tigris)
+#Simple features.
+library(sf)
+#Eventually necessary for mapping.
+library(ggmap)
+#Needed for dividing into training and test sets.
+library(caret)
+#Needed for identifying collinear variables.
+library(car)
+#Needed for regularization
+library(glmnet)
+```
+
+1. Data preparation: 
+
+
+The foreclosure dataset contains 71676 rows and 10 columns, including the street number, street name, city, state and zip code of each foreclosure. For our purposes, only the components of the address will be needed. 
+
+```{r}
+# Read in the initial dataset, setting a guess_max limit to improve the accuracy of the data types assigned to each column.
+foreclosure_pg <- read_csv("datasets/pg_foreclosures.csv", guess_max = 71676)
+```
+Because we will need to group foreclosure records by census tract, we first need to determine the census tract identification number for each address in the original dataset. The geolocation service Geocodio (https://www.geocod.io/) provides two options: An API or a straightforward upload process. The Geocodio API instructions were too convoluted for our specific task, so instead, we uploaded the addresses from the original dataset, producing a new dataset that includes each address and the corresponding census tract identification number, among other geolocation datapoints.
+
+```{r}
+#Read in the geocoded address dataset.
+foreclosure_pg_census_tracts <- read_csv("datasets/pg_foreclosure_tract_geocodio.csv", guess_max = 71676) |>
+  clean_names()
+```
+For our eventual predictive analysis, we want a sample of at least 100 census tracts to improve the accuracy of our model. We can use the unique() function to count the number of unique tract codes in the pg_foreclosure_census_tracts dataframe.
+
+```{r}
+# Calculate the number of unique tracts in the geocoded address dataframe.
+tracts_unique <- length(unique(foreclosure_pg_census_tracts$census_tract_code))
+
+print(tracts_unique)
+```
+While some of those tracts may be erroneous -- in another state, for instance -- we are comfortably above the 100-tract threshhold.
+
+We can now use an inner join to combine the original dataset with the address and tract dataset using the matching values in the "location" columns. We will also need year and year_month columns for future plotting, so we add those here and format them as date type. 
+
+```{r}
+# Perform inner join based on the 'location' column.
+pg_foreclosures_with_tracts <- inner_join(foreclosure_pg, foreclosure_pg_census_tracts, by = "location")
+
+# Convert "submitteddate" column to date type.
+pg_foreclosures_with_tracts$submitteddate <- as.Date(pg_foreclosures_with_tracts$submitteddate, format = "%m/%d/%Y")
+
+# Extract the year and month from "submitteddate".
+pg_foreclosures_with_tracts$year <- year(pg_foreclosures_with_tracts$submitteddate)
+pg_foreclosures_with_tracts$month <- month(pg_foreclosures_with_tracts$submitteddate)
+
+# Create a year-month column for eventual plotting.
+pg_foreclosures_with_tracts$year_month <- as.Date(paste(pg_foreclosures_with_tracts$year, pg_foreclosures_with_tracts$month, "01", sep = "-"), format = "%Y-%m-%d")
+
+# Print the dataset.
+print(pg_foreclosures_with_tracts)
+```
+Unfortunately, the joining process produces tens of thousands of duplicates -- the result of duplicate addresses appearing in the original dataset. For some reason, this problem persists regardless of what type of join we use. 
+
+To remove those duplicates, we need to identify sets of duplicate rows using the values that will match within a set of duplicates: the values in the "street_address", "city.y" and "propertyid" columns. We will also use the "year_month" column to catch duplicate records that vary slightly in the "submitteddate" column -- a decision we make on the assumption that a single property cannot be foreclosed upon more than once in a single month. This step allows us to clean duplicate records that existed in the original dataset as well as those created by the joining process. We will keep only a single record from each matching set.
+
+```{r}
+# Order the dataframe by the columns that identify remainins duplicate rows.
+
+pg_foreclosures_with_tracts <- pg_foreclosures_with_tracts[order(pg_foreclosures_with_tracts$propertyid, pg_foreclosures_with_tracts$street_address, pg_foreclosures_with_tracts$city.y, pg_foreclosures_with_tracts$submitteddate), ]
+
+# Keep only the last row from each set of duplicates
+pg_foreclosures_filtered <- subset(pg_foreclosures_with_tracts, !duplicated(pg_foreclosures_with_tracts[, c("propertyid", "street_address", "city.y", "submitteddate")], fromLast = TRUE))
+
+# Reset row names if necessary
+rownames(pg_foreclosures_filtered) <- NULL
+```
+
+Because we need to group by census tract, we now remove any records that are missing a value in the census tract code column. This removed roughly 120 records.
+
+```{r}
+# Filter the pg_foreclosures_filtered dataset to remove rows with missing values in the census_tract_code column. 
+pg_foreclosures_filtered <- pg_foreclosures_filtered[!is.na(pg_foreclosures_filtered$census_tract_code), ]
+```
+
+We can clean up our dataset by removing extraneous columns created by Geocodio.
+```{r}
+# Remove unnecessary columns with the select() function.
+pg_foreclosures_filtered <- pg_foreclosures_filtered %>%
+  select(-accuracy_score, -accuracy_type, -source, -full_fips_block, -metro_micro_statistical_area_name,-metro_micro_statistical_area_code, -metro_micro_statistical_area_type, -combined_statistical_area_name, -metropolitan_division_area_name, -metropolitan_division_area_code, -addressoccupied)
+```
+
+Next, we remove all records for addresses outside of Maryland. 
+
+```{r}
+# Remove non-Maryland addresses from the dataset.
+pg_foreclosures_filtered <- pg_foreclosures_filtered |>
+  filter(state.x == "MD")
+```
+
+With only Maryland addresses remaining, we can group by census tract identification code and use the joining process with American Community Survey data to continue the cleaning process later.
+
+```{r}
+# Group by census_tract_code and summarize to count the number of foreclosures per tract.
+pg_foreclosures_per_tract <- pg_foreclosures_filtered |>
+  group_by(census_tract_code) |>
+  summarize(
+    great_recession_foreclosures = sum(year <= 2010, na.rm = TRUE),
+    post_2010_foreclosures = sum(year > 2010, na.rm = TRUE)
+  )
+```
+
+
+The independent variables we will need for our predictive model will come from the American Community Survey (ACS). To access ACS data, we use a Census API key -- stored locally for security. 
+
+As a building block for per capita calculations, we need the population of each census tract as of the 2016-2020 ACS and the 2006-2010 ACS. Because the variable codes for the 2020 Census are harder to search, we will rely on the ACS instead of the Census. 
+
+The B01003_001 variable represents total population.
+```{r}
+#Grab 2020 population by Maryland tract using American Community Survey API.
+md_tract_pop_2020 <- get_acs(geography = "tract",
+              variables = c(tract_pop = "B01003_001"),
+              state = "MD",
+              year = 2020,
+              geometry = TRUE)
+
+md_tract_pop_2010 <- get_acs(geography = "tract",
+              variables = c(tract_pop = "B01003_001"),
+              state = "MD",
+              year = 2010,
+              geometry = TRUE)
+```
+We only need tracts in Prince George's County, so we can use the "NAME" column from the ACS data to filter out tracts in other counties. The ACS data appends the Maryland state identification number (24) and the Prince George's County identification number (033) to the beginning of each tract identification number, so we also need to create a new column for the stand-alone tract identification numbers.
+
+```{r}
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_tract_pop_2020 <- md_tract_pop_2020[str_detect(md_tract_pop_2020$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_tract_pop_2020$tract_number <- gsub('24033', '', pg_tract_pop_2020$GEOID)
+```
+
+We can now join the pg_foreclosures_per_tract dataset with the pg_tract_pop_2020 dataset. By using a left join, we filter out foreclosures in tracts that -- according to Geocodio -- are not in Prince George's County. While this eliminated more than 200 records, we are still left with 214 tracts' worth of data for our model.
+
+```{r}
+# Left join the pg_tract_pop_2020 data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_tract_pop_2020, pg_foreclosures_per_tract, by=c("tract_number" = "census_tract_code")) |>
+  #Rename the "estimate" variable
+  rename(tract_pop_2020 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) |> 
+  #Add a column for post-great recession foreclosures per capita using 2020 ACS population estimate.
+  mutate(foreclosure_pc_2020 = (post_2010_foreclosures/tract_pop_2020)*1000)
+```
+
+We also need to join the dataset with the tract population estimates from the 2006-2010 ACS. Because new tracts may have been added since 2010, we left-join to retain as much data as possible from 2020.
+
+```{r}
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_tract_pop_2010 <- md_tract_pop_2010[str_detect(md_tract_pop_2010$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_tract_pop_2010$tract_number <- gsub('24033', '', pg_tract_pop_2010$GEOID)
+```
+
+Because both the 2006-2010 tract population estimates dataset and the new foreclosures per capita dataset have geometries associated with each tract, they are sf objects. The join function for sf objects, st_join, requires us to join by geometry, but geometries for census tracts can change slightly over time. This, of course, makes it difficult to be completely precise, but it appears that only four new tracts in PG county appeared between 2010 and 2016, so it introduces only a minor inconsistency into our dataset.
+
+Regardless, we need to convert the sf objects to standard dataframes so that we can join by tract number, not geometry -- joining by geometry would give us multiple records for each version of the geometry.
+
+```{r}
+# Convert sf objects to data frames
+pg_tract_pop_df <- as.data.frame(pg_tract_pop_2010)
+pg_foreclosures_df <- as.data.frame(pg_foreclosures_per_tract)
+
+# Perform left join based on "tract_number" column
+pg_foreclosures_per_tract<- left_join(pg_tract_pop_df, pg_foreclosures_df, by = c("tract_number" = "tract_number"))
+
+# Rename the "estimate" variable
+pg_foreclosures_per_tract <- rename(pg_foreclosures_per_tract, tract_pop_2010 = estimate)
+
+# Add a column for foreclosures per capita during the height of the great recession using 2010 ACS data.
+pg_foreclosures_per_tract <- pg_foreclosures_per_tract |>
+  mutate(foreclosure_pc_2010 = (great_recession_foreclosures/tract_pop_2010)*1000)
+```
+
+
+We will now repeat the process with other ACS variables, starting with median household income. We will use the median household income as of the 2016-2020 ACS as a stand-alone independent variable and use the changes between the 2006-2010, 2011-2015 and 2016-2020 ACS as separate independent variables.
+
+Median household income as of the 2006-2010:
+```{r}
+#Grab median household income as of the 2006-2010 ACS.
+md_medhouseholdincome_2010_tract <- get_acs(geography = "tract", state="MD",
+              variables = c(medhouseholdincome_2010 = "B19013_001"),
+              year = 2010)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_medhouseholdincome_2010_tract <- md_medhouseholdincome_2010_tract[str_detect(md_medhouseholdincome_2010_tract$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_medhouseholdincome_2010_tract$tract_number <- gsub('24033', '', pg_medhouseholdincome_2010_tract$GEOID)
+```
+Median household income as of the 2011-2015 ACS
+
+```{r}
+md_medhouseholdincome_2015_tract <- get_acs(geography = "tract", state="MD",
+              variables = c(medhouseholdincome_2015 = "B19013_001"),
+              year = 2015)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_medhouseholdincome_2015_tract <- md_medhouseholdincome_2015_tract[str_detect(md_medhouseholdincome_2015_tract$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_medhouseholdincome_2015_tract$tract_number <- gsub('24033', '', pg_medhouseholdincome_2015_tract$GEOID)
+              
+```
+Median household income as of the 2016-2020 ACS:
+```{r}
+md_medhouseholdincome_2020_tract <- get_acs(geography = "tract", state="MD",
+              variables = c(medhouseholdincome_2020= "B19013_001"),
+              year = 2020)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_medhouseholdincome_2020_tract <- md_medhouseholdincome_2020_tract[str_detect(md_medhouseholdincome_2020_tract$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_medhouseholdincome_2020_tract$tract_number <- gsub('24033', '', pg_medhouseholdincome_2020_tract$GEOID)
+```
+
+We also need the estimated total number of housing units at the tract level. We will use the three consecutive ACS estimates as a denominator to calculate owner-occupied housing/total number of housing units, and we will use the change between those rates as an independent variable. 
+
+Total housing units as of 2006-2010 ACS:
+```{r}
+md_total_housing_2010 <- get_acs(geography = "tract",
+              variables = c(total_housing_2010 = "B25001_001"),
+              state = "MD",
+              year = 2010)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_total_housing_2010 <- md_total_housing_2010[str_detect(md_total_housing_2010$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_total_housing_2010$tract_number <- gsub('24033', '', pg_total_housing_2010$GEOID)
+```
+Total housing units as of 2011-2015 ACS:
+```{r}
+md_total_housing_2015 <- get_acs(geography = "tract",
+              variables = c(total_housing_2015 = "B25001_001"),
+              state = "MD",
+              year = 2015)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_total_housing_2015 <- md_total_housing_2015[str_detect(md_total_housing_2015$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_total_housing_2015$tract_number <- gsub('24033', '', pg_total_housing_2015$GEOID)
+```
+
+Total housing units as of 2016-2020 ACS.
+```{r}
+md_total_housing_2020 <- get_acs(geography = "tract",
+              variables = c(total_housing_2020 = "B25001_001"),
+              state = "MD",
+              year = 2020)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_total_housing_2020 <- md_total_housing_2020[str_detect(md_total_housing_2020$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_total_housing_2020$tract_number <- gsub('24033', '', pg_total_housing_2020$GEOID)
+```
+
+For the numerator in the aforementioned calculation, we also need the number of owner occupied units recorded in three consecutive ACS. 
+
+Owner-occupied housing as of 2006-2010 ACS:
+```{r}
+md_owner_housing_2010 <- get_acs(geography = "tract",
+              variables = c(owner_housing_2015 = "B25003_002"),
+              state = "MD",
+              year = 2010)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_owner_housing_2010 <- md_owner_housing_2010[str_detect(md_owner_housing_2010$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_owner_housing_2010$tract_number <- gsub('24033', '', pg_owner_housing_2010$GEOID)
+```
+
+Owner-occupied housing as of 2011-2015 ACS:
+```{r}
+md_owner_housing_2015 <- get_acs(geography = "tract",
+              variables = c(owner_housing_2015 = "B25003_002"),
+              state = "MD",
+              year = 2015)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_owner_housing_2015 <- md_owner_housing_2015[str_detect(md_owner_housing_2015$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_owner_housing_2015$tract_number <- gsub('24033', '', pg_owner_housing_2015$GEOID)
+```
+
+Owner-occupied housing as of 2016-2020 ACS:
+```{r}
+md_owner_housing_2020 <- get_acs(geography = "tract",
+              variables = c(owner_housing_2020 = "B25003_002"),
+              state = "MD",
+              year = 2020)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_owner_housing_2020 <- md_owner_housing_2020[str_detect(md_owner_housing_2020$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_owner_housing_2020$tract_number <- gsub('24033', '', pg_owner_housing_2020$GEOID)
+```
+
+To calculate the ratio of mortgaged housing units to total housing units over a decade, we will need the ACS estimates for "housing units with a mortgage, contract to purchase, or similar debt."
+
+Mortgaged housing as of 2006-2010 ACS:
+```{r}
+md_debt_housing_2010 <- get_acs(geography = "tract",
+              variables = c(debt_housing_2010 = "B25081_002"),
+              state = "MD",
+              year = 2010)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_debt_housing_2010 <- md_debt_housing_2010[str_detect(md_debt_housing_2010$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_debt_housing_2010$tract_number <- gsub('24033', '', pg_debt_housing_2010$GEOID)
+```
+
+
+Mortgaged housing as of 2011-2015 ACS:
+```{r}
+md_debt_housing_2015 <- get_acs(geography = "tract",
+              variables = c(debt_housing_2015 = "B25081_002"),
+              state = "MD",
+              year = 2015)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_debt_housing_2015 <- md_debt_housing_2015[str_detect(md_debt_housing_2015$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_debt_housing_2015$tract_number <- gsub('24033', '', pg_debt_housing_2015$GEOID)
+```
+
+Mortgaged housing as of the 2016-2020 ACS:
+```{r}
+md_debt_housing_2020 <- get_acs(geography = "tract",
+              variables = c(debt_housing_2020 = "B25081_002"),
+              state = "MD",
+              year = 2020)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_debt_housing_2020 <- md_debt_housing_2020[str_detect(md_debt_housing_2020$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_debt_housing_2020$tract_number <- gsub('24033', '', pg_debt_housing_2020$GEOID)
+```
+
+
+While the relationship between age and foreclosure risk is unclear, it will be worthwhile to ascertain whether there is a strong correlation between foreclosure rate per capita and median age at the tract level. For that, we need the median age at the tract level from the 2016-2020 ACS. 
+```{r}
+md_medage_2020 <- get_acs(geography = "tract",
+              variables = c(medage_2020 = "B01002_001"),
+              state = "MD",
+              year = 2020)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_medage_2020 <- md_medage_2020[str_detect(md_medage_2020$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_medage_2020$tract_number <- gsub('24033', '', pg_medage_2020$GEOID)
+```
+
+The relationship between foreclosure risk and the share of non-Hispanic white people in a given geography is well-documented, with race and ethnicity data standing in for longstanding economic inequalities that often split on racial lines -- particularly in urban and suburban communities like Prince George's County. We will use these datapoints in two ways:
+
+
+The 2006-2010 ACS estimates for non-Hispanic white population by tract will be used to calculate the change in non-Hispanic white population by tract between 2010 and 2020. 
+```{r}
+md_nhwhite_2010 <- get_acs(geography = "tract", state="MD",
+  variables = c(nhwhite_2010 = "B03002_003E"), year = 2010)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_nhwhite_2010 <- md_nhwhite_2010[str_detect(md_nhwhite_2010$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_nhwhite_2010$tract_number <- gsub('24033', '', pg_nhwhite_2010$GEOID)
+```
+The 2016-2020 ACS estimates for non-Hispanic white population by tract will be use to complete the year-over-year percentage change calculation and as a stand-alone independent variable.
+
+```{r}
+md_nhwhite_2020 <- get_acs(geography = "tract", state="MD",
+  variables = c(nhwhite_2020 = "B03002_003E"), year = 2020)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_nhwhite_2020 <- md_nhwhite_2020[str_detect(md_nhwhite_2020$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_nhwhite_2020$tract_number <- gsub('24033', '', pg_nhwhite_2020$GEOID)
+```
+
+We will use the 2006-2010 ACS estimates of the population with "income in the past 12 months below poverty level" and the 2016-2020 ACS estimates of the same variable for another comparison. Because this number includes all people over the age of 5, it is an imperfect measurement of poverty rate because it includes both children and adults. It is, however, simpler than adding the totals for each age group over the age of 18 and comparing those poverty rates to the share of the population in each tract that falls into each age group.
+
+Number of people (>5 years old) with incomes below poverty level by census tract as of the 2006-2010 ACS:
+
+```{r}
+md_poverty_2010 <- get_acs(geography = "tract", state="MD",
+  variables = c(poverty_2020 = "B16009_002E"), year = 2010)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_poverty_2010 <- md_poverty_2010[str_detect(md_poverty_2010$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_poverty_2010$tract_number <- gsub('24033', '', pg_poverty_2010$GEOID)
+```
+
+
+Number of people (>5 years old) with incomes below poverty level by census tract as of the 2016-2020 ACS:
+
+```{r}
+md_poverty_2020 <- get_acs(geography = "tract", state="MD",
+  variables = c(poverty_2020 = "B16009_002E"), year = 2020)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_poverty_2020 <- md_poverty_2020[str_detect(md_poverty_2020$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_poverty_2020$tract_number <- gsub('24033', '', pg_poverty_2020$GEOID)
+```
+
+Lastly, we will use the ACS API to pull the median reported home value from the 2016-2020 ACS at the tract level. This is an imperfect measure because it is self-reported, but given that we cannot afford to generate tract identification numbers for all properties listed in the Prince George's County real estate assessment value dataset, it is the second-best approximation of home value available to us.
+
+```{r}
+md_homevalue_2020 <- get_acs(geography = "tract", state="MD",
+  variables = c(homevalue_2020 = "B25107_001E"), year = 2020)
+
+# Use the str_detect function and the string "Prince George" to isolate tracts in Prince George's County.
+pg_homevalue_2020 <- md_homevalue_2020[str_detect(md_homevalue_2020$NAME, "Prince George"), ]
+
+# Use the gsub function to remove the '24033' prefix from census tract identification numbers and save the results in a new 'tract_number' column. 
+pg_homevalue_2020$tract_number <- gsub('24033', '', pg_homevalue_2020$GEOID)
+```
+
+At last, we can begin joining the ACS data to our core dataset. 
+
+
+We start by joining the core dataset with the data on median household income by tract:
+
+```{r}
+# Left join the 2006-2010 ACS median household income data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_medhouseholdincome_2010_tract, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_medincome_2010 = estimate)
+```
+
+```{r}
+# Left join the 2011-2015 ACS median household income data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_medhouseholdincome_2015_tract, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_medincome_2015 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable, -GEOID.x) 
+```
+
+```{r}
+# Left join the 2016-2020 ACS median household income data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_medhouseholdincome_2020_tract, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_medincome_2020 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) 
+```
+
+
+We join the core dataset with the data on the number of housing units per tract:
+
+```{r}
+# Left join the 2006-2010 ACS housing unit data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_total_housing_2010, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_housingunits_2010 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) 
+```
+
+```{r}
+# Left join the 2011-2015 ACS housing unit data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_total_housing_2015, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_housingunits_2015 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) 
+```
+
+```{r}
+# Left join the 2016-2020 ACS housing unit data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_total_housing_2020, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_housingunits_2020 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) 
+```
+
+We join the core dataset with the data on the number of owner-occupied housing units per tract:
+
+```{r}
+# Left join the 2006-2010 ACS owner-occupied housing data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_owner_housing_2010, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_owneroccupied_2010 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) 
+```
+
+```{r}
+# Left join the 2011-2015 ACS owner-occupied housing data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_owner_housing_2015, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_owneroccupied_2015 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) 
+```
+
+```{r}
+# Left join the 2016-2020 ACS owner-occupied housing data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_owner_housing_2020, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_owneroccupied_2020 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) 
+```
+
+We join the core dataset with the data on the number of mortgaged housing units per tract:
+
+```{r}
+# Left join the 2006-2010 ACS mortgaged housing data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_debt_housing_2010, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_mortgaged_2010 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) 
+```
+
+```{r}
+# Left join the 2011-2015 ACS mortgaged housing data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_debt_housing_2015, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_mortgaged_2015 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) 
+```
+
+```{r}
+# Left join the 2016-2020 ACS mortgaged housing data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_debt_housing_2020, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_mortgaged_2020 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) 
+```
+
+We join the core dataset with the data on the median age of residents by tract:
+
+```{r}
+# Left join the 2006-2010 ACS median age data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_medage_2020, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_medage_2020 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) 
+```
+
+We join the core dataset with the data on the number of residents identified as non-Hispanic white per tract:
+
+```{r}
+# Left join the 2006-20210 ACS non-Hispanic white population data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_nhwhite_2010, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_nhwhite_2010 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) 
+```
+
+```{r}
+# Left join the 2016-2020 ACS non-Hispanic white population data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_nhwhite_2020, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_nhwhite_2020 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) 
+```
+
+
+We join the core dataset with the data on the number of residents (age >5) with an income below the poverty level in the previous 12 months:
+
+```{r}
+# Left join the 2006-2010 ACS poverty data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_poverty_2010, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_poverty_2010 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) 
+```
+
+```{r}
+# Left join the 2016-2020 ACS poverty data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_poverty_2020, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_poverty_2020 = estimate) |>
+  #Remove extraneous columns, taking the opportunity to clear the extraneous columns that have accumulated during the joining process. 
+  select(-NAME, -variable, -GEOID.x.x.x.x.x.x.x.x, -moe.x.x.x.x.x.x.x.x.x, -GEOID.y, -moe.y, -GEOID.x.x.x.x.x.x.x, -moe.x.x.x.x.x.x.x.x, - GEOID.y.y, -moe.y.y, -GEOID.x.x.x.x.x.x, -moe.x.x.x.x.x.x.x, -GEOID.y.y.y, -moe.y.y.y, -GEOID.x.x.x.x.x, -moe.x.x.x.x.x.x, -GEOID.y.y.y.y, -moe.y.y.y.y, -GEOID.x.x.x.x, -moe.x.x.x.x.x, -GEOID.y.y.y.y.y, -moe.y.y.y.y.y, -GEOID.x, -moe.x.x.x.x, -GEOID.y.y.y.y.y.y, -moe.y.y.y.y.y.y, -GEOID.x.x.x, -moe.x.x.x, -GEOID.y.y.y.y.y.y.y, -moe.y.y.y.y.y.y.y, -GEOID.x.x, -moe.x.x, -GEOID.y.y.y.y.y.y.y.y, -moe.y.y.y.y.y.y.y.y, -moe.x) 
+```
+
+We join the core dataset with the data on the self-reported median reported value of homes in a given tract from the 2016-2020 ACS. Because this datapoint is self-reported, it is certainly less accurate than the Maryland tax assessment data, which we would use absent storage and cost restraints.
+
+```{r}
+# Left join the 2016-2020 ACS self-reported median home value data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_homevalue_2020, pg_foreclosures_per_tract, by=c("tract_number")) |>
+  #Rename the "estimate" variable
+  rename(tract_homevalue_2020 = estimate) |>
+  #Remove extraneous columns.
+  select(-NAME, -variable) 
+```
+
+Outside of this markdown, one of our team members created a spreadsheet containing the number of units built in each decade from 1940 to 1920, with columns for units built before 1939 and after 2020, and the average number of bedrooms per house. 
+
+We will read that .csv file in and append it to the core dataset after adjusting the new dataframe's "tract" column to match the "tract_number" column in the pg_foreclosures_by_tract dataset.
+
+
+```{r}
+#Read in the geocoded construction year and median bedroom number dataset. 
+
+pg_yr_bd_avg_tract <- read_csv("datasets/pg_yr_bd_avg_tract.csv", guess_max = 214) |>
+  clean_names()
+```
+We use the gsub() and substr() functions to extract tract numbers from strings in the "tract" column of the new dataset.
+
+```{r}
+# Extract the digits from the strings in the "tract" column of the pg_yr_bd_avg_tract dataset
+pg_yr_bd_avg_tract$tract_number <- gsub("[^0-9]", "", pg_yr_bd_avg_tract$tract)
+
+# Extract the first four digits followed by the two digits after the period
+pg_yr_bd_avg_tract$tract_number <- substr(pg_yr_bd_avg_tract$tract_number, 1, 6)
+
+# Showing the updated dataframe
+print(pg_yr_bd_avg_tract)
+```
+
+```{r}
+# Left join the 2006-2010 ACS median household income data from the ACS with the pg_foreclosures_per_tract dataset.
+pg_foreclosures_per_tract <- left_join(pg_yr_bd_avg_tract, pg_foreclosures_per_tract, by=c("tract_number"))
+```
+
+Finally, because our dependent variable is foreclosures per capita based on the 2016-2020 ACS population estimates, we can filter out dataset to exclude rows with missing values in the foreclosure_pc_2020 column. 
+
+```{r}
+pg_foreclosures_per_tract <- pg_foreclosures_per_tract[!is.na(pg_foreclosures_per_tract$foreclosure_pc_2020), ]
+```
+
+The last filter pares our dataset down to 173 rows -- still over the 100-tract threshold, but close enough that we will need to be mindful when creating test sets. 
+
+To visualize the distribution of our dependent variable and identify possible outliers, we can plot a histogram of foreclosure rates per 1,000 residents for each remaining census tract in our dataset.
+
+```{r}
+#Calculate quintiles
+quintiles <- quantile(pg_foreclosures_per_tract$foreclosure_pc_2020, probs = seq(0, 1, by = 0.25))
+
+#Plot the distribution of foreclosure per capita values
+hist(pg_foreclosures_per_tract$foreclosure_pc_2020, 
+     main = "Distribution of Per Capita Foreclosure Rates by Census Tract",
+     xlab = "Foreclosures per 1,000 Residents by Census Tract",
+     ylab = "Number of Census Tracts")
+
+# Add vertical lines for quintiles
+abline(v = quintiles, col = "red", lty = 2)
+```
+We now need to calculate percentage figures for each of the variables we have added to the dataset for a more straightforward comparison.
+
+```{r}
+pg_foreclosures_per_tract <- pg_foreclosures_per_tract |>
+  mutate(pct_built_2020_later = year_structure_built_total_housing_units_built_2020_or_later / year_structure_built_total_housing_units) |>
+  mutate(pct_built_2010_2019 = year_structure_built_total_housing_units_built_2010_to_2019 / year_structure_built_total_housing_units) |>
+  mutate(pct_built_2000_2009 = year_structure_built_total_housing_units_built_2000_to_2009 / year_structure_built_total_housing_units) |>
+  mutate(pct_built_1990_1999 = year_structure_built_total_housing_units_built_1990_to_1999 / year_structure_built_total_housing_units) |>
+  mutate(pct_built_1980_1989 = year_structure_built_total_housing_units_built_1980_to_1989 / year_structure_built_total_housing_units) |>
+  mutate(pct_built_1970_1979 = year_structure_built_total_housing_units_built_1970_to_1979 / year_structure_built_total_housing_units) |>
+  mutate(pct_built_pre_1960 = (year_structure_built_total_housing_units_built_1960_to_1969 + year_structure_built_total_housing_units_built_1950_to_1959 + year_structure_built_total_housing_units_built_1940_to_1949 + year_structure_built_total_housing_units_built_1939_or_earlier) / year_structure_built_total_housing_units) |>
+  mutate(pct_0_bd = bedrooms_total_housing_units_no_bedroom / bedrooms_total_housing_units) |>
+  mutate(pct_1_bd = bedrooms_total_housing_units_1_bedroom / bedrooms_total_housing_units) |>
+  mutate(pct_2_bd = bedrooms_total_housing_units_2_bedrooms / bedrooms_total_housing_units) |>
+  mutate(pct_3_bd = bedrooms_total_housing_units_3_bedrooms / bedrooms_total_housing_units) |>
+  mutate(pct_4_more_bd = (bedrooms_total_housing_units_4_bedrooms + bedrooms_total_housing_units_5_or_more_bedrooms) / bedrooms_total_housing_units) |>
+  mutate(poverty_2010 = tract_poverty_2010/ tract_pop_2010) |>
+  mutate(poverty_2020 = tract_poverty_2020/ tract_pop_2020) |>
+  mutate(nhwhite_2010 = tract_nhwhite_2010/ tract_pop_2010) |>
+  mutate(nhwhite_2020 = tract_nhwhite_2020/ tract_pop_2020) |>
+  mutate(mortgaged_2010 = tract_mortgaged_2010/tract_housingunits_2010) |>
+  mutate(mortgaged_2015 = tract_mortgaged_2015/tract_housingunits_2015) |>
+  mutate(mortgaged_2020 = tract_mortgaged_2020/tract_housingunits_2020) |>
+  mutate(ownoccupied_2010 = tract_owneroccupied_2010/tract_housingunits_2010) |>
+  mutate(ownoccupied_2015 = tract_owneroccupied_2015/tract_housingunits_2015) |>
+  mutate(ownoccupied_2020 = tract_owneroccupied_2020/tract_housingunits_2020) |>
+  mutate(mortgage_change_2010_2015 = mortgaged_2015-mortgaged_2010) |>
+  mutate(mortgage_change_2015_2020 = mortgaged_2020-mortgaged_2015) |>
+  mutate(mortgage_change_2010_2020 = mortgaged_2010-mortgaged_2020) |>
+  mutate(ownoccupied_change_2010_2015 = ownoccupied_2015-ownoccupied_2010) |>
+  mutate(ownoccupied_change_2015_2020 = ownoccupied_2020-ownoccupied_2015) |>
+  mutate(ownoccupied_change_2010_2020 = ownoccupied_2020-ownoccupied_2010) |>
+  mutate(poverty_change_2010_2020 = poverty_2020-poverty_2010) |>
+  mutate(nhwhite_change_2010_2020 = nhwhite_2020-nhwhite_2010) |>
+  mutate(medincome_change_2010_2015 = (tract_medincome_2015-tract_medincome_2010)/tract_medincome_2010) |>
+  mutate(medincome_change_2015_2020 = (tract_medincome_2020-tract_medincome_2015)/tract_medincome_2015) |>
+  mutate(medincome_change_2010_2020 = (tract_medincome_2020-tract_medincome_2010)/tract_medincome_2010) |>
+  mutate(pop_change_pct = (tract_pop_2020-tract_pop_2010)/tract_pop_2010)
+```
+
+```{r}
+pg_foreclosures_per_tract <- pg_foreclosures_per_tract |>
+  select(-tract, -year_structure_built_total_housing_units, -year_structure_built_total_housing_units_built_1939_or_earlier, -year_structure_built_total_housing_units_built_1940_to_1949, -year_structure_built_total_housing_units_built_1950_to_1959, -year_structure_built_total_housing_units_built_1960_to_1969, -year_structure_built_total_housing_units_built_1970_to_1979, -year_structure_built_total_housing_units_built_1980_to_1989, -year_structure_built_total_housing_units_built_1990_to_1999, -year_structure_built_total_housing_units_built_2000_to_2009, -year_structure_built_total_housing_units_built_2010_to_2019, -year_structure_built_total_housing_units_built_2020_or_later, 
+-bedrooms_total_housing_units, -bedrooms_total_housing_units_1_bedroom, -bedrooms_total_housing_units_no_bedroom, -bedrooms_total_housing_units_2_bedrooms, -bedrooms_total_housing_units_3_bedrooms, -bedrooms_total_housing_units_4_bedrooms, -bedrooms_total_housing_units_5_or_more_bedrooms, -GEOID.x, -moe.x, -GEOID.y, -moe.y, -tract_poverty_2010, -tract_poverty_2020, -tract_nhwhite_2010, -tract_nhwhite_2020, -tract_mortgaged_2010, -tract_mortgaged_2015, -tract_mortgaged_2020, -tract_owneroccupied_2010, -tract_owneroccupied_2015, -tract_owneroccupied_2020, -tract_housingunits_2010, -tract_housingunits_2015, -tract_housingunits_2020, -tract_medincome_2015, -NAME.x, -variable.x, -NAME.y, -variable.y, -geometry.x, -geometry.y, -GEOID.y.y.y.y.y.y.y.y.y, -moe.y.y.y.y.y.y.y.y.y, -avg_year_built, -avg_year_built_number
+         )
+```
+
+
+```{r}
+# Create vector to count missing values by column. 
+missing_values_count <- colSums(is.na(pg_foreclosures_per_tract))
+
+# Print the number of missing values in each column
+print(missing_values_count)
+```
+Because there are only three missing values in the tract_homevalue_2020 column -- and nowhere else in the dataset -- we can impute the missing values using the median home value for PG county with relatively little impact.
+
+```{r}
+# Replace missing values in tract_homevalue_2020 with the mean of the column
+median_value <- median(pg_foreclosures_per_tract$tract_homevalue_2020, na.rm = TRUE)
+pg_foreclosures_per_tract$tract_homevalue_2020[is.na(pg_foreclosures_per_tract$tract_homevalue_2020)] <- median_value
+```
+
+
+We write the foreclosures_per_tract dataframe to a .csv for our secondary markdowns.
+
+```{r}
+write_csv(pg_foreclosures_per_tract, "datasets/pg_foreclosures_per_tract.csv")
+```
+
+
+
+2. Linear regression parameters:  
+
+First, we need to define the list of independent variables we will use in our linear regression model. We will call this initial list "variables_of_interest."
+
+```{r}
+# Selecting the variables of interest (excluding foreclosure_pc_2020)
+variables_of_interest <- c("avg_bed", "tract_homevalue_2020", "tract_medage_2020", "tract_medincome_2020", 
+                            "tract_medincome_2010", "foreclosure_pc_2010", 
+                            "pct_built_2020_later", "pct_built_2010_2019", "pct_built_2000_2009", 
+                            "pct_built_1990_1999", "pct_built_1980_1989", "pct_built_1970_1979", 
+                            "pct_built_pre_1960", "pct_0_bd", "pct_1_bd", "pct_2_bd", "pct_3_bd", 
+                            "pct_4_more_bd", "poverty_2010", "poverty_2020", "nhwhite_2010", "nhwhite_2020", 
+                            "mortgaged_2010", "mortgaged_2015", "mortgaged_2020", "ownoccupied_2010", 
+                            "ownoccupied_2015", "ownoccupied_2020", "mortgage_change_2010_2015", 
+                            "mortgage_change_2015_2020", "mortgage_change_2010_2020","ownoccupied_change_2010_2015",                             "ownoccupied_change_2015_2020", "ownoccupied_change_2010_2020",
+                            "poverty_change_2010_2020","nhwhite_change_2010_2020","medincome_change_2010_2015",
+                            "medincome_change_2015_2020", "medincome_change_2010_2020", "pop_change_pct")
+```
+
+Next, we divide our data into training and test sets.
+
+```{r}
+# Set seed for reproducibility
+set.seed(123)
+
+# Split data into training and testing datasets (e.g., 80% training, 20% testing)
+train_indices <- createDataPartition(pg_foreclosures_per_tract$foreclosure_pc_2020, p = 0.7, list = FALSE)
+pg_foreclosures_train <- pg_foreclosures_per_tract[train_indices, ]
+pg_foreclosures_test <- pg_foreclosures_per_tract[-train_indices, ]
+```
+
+Next, we loop over each independent variable and extract the information needed for question 1a. 
+
+```{r}
+for (variable in variables_of_interest) {
+  # Perform linear regression
+  model <- lm(foreclosure_pc_2020 ~ ., data = pg_foreclosures_train[, c(variable, "foreclosure_pc_2020")])
+  
+  # Extract required information
+  intercept <- coef(model)[1]
+  coefficient <- coef(model)[2]
+  
+  # Check if the coefficient is statistically significant
+  p_value <- summary(model)$coefficients[which(rownames(summary(model)$coefficients) == variable), "Pr(>|t|)"]
+  is_predictive <- ifelse(p_value < 0.05, "Yes", "No")
+  
+  # Compute residuals
+  residuals <- resid(model)
+  
+  # Compute correlation between predicted and real values
+  correlation <- cor(predict(model), pg_foreclosures_train$foreclosure_pc_2020 )
+  
+  # Compute mean square error
+  mse <- mean((predict(model) - pg_foreclosures_train$foreclosure_pc_2020 )^2)
+  
+  # Print results
+  cat("Variable:", variable, "\n")
+  cat("Intercept:", intercept, "\n")
+  cat("Coefficient:", coefficient, "\n")
+  cat("Is it a predictive feature?:", is_predictive, "\n")
+  cat("Correlation:", correlation, "\n")
+  cat("Mean Square Error:", mse, "\n")
+  cat("\n")
+}
+```
+Evidently, the most predictive features are:
+
+1. mortgaged_2010/mortgaged_2015/mortgaged_2020. These are perhaps a little too obvious -- zip codes with more mortgaged homes are intuitively more likely to have a higher number of foreclosures per capita.
+
+2. foreclosure_pc_2010. Once again, this is intuitive -- tracts that saw more foreclosures per capita during the height of the great recession likely have risk factors (included in our list of variables or not) that remained after 2010.
+
+3. ownoccupied_2010/ownoccupied_2015/ownoccupied_2020. See (1).
+
+4. tract_medage_2020. According to the linear model, tracts with a higher median age are more likely to see higher rates of foreclosure per capita.
+
+5. pct_1_bd/avg_bed. The exact reason for this correlation is not entirely clear.
+
+6. poverty_2010. The tract-level poverty rate in 2020 is more predictive than the poverty rate in 2010 and the median income at the tract leve in 2010 or 2020. This may be misleading -- a tract that saw a high rate of foreclosures between 2010-2020 may be poorer as a result of those foreclosures.
+
+
+For readability, we can plot the residuals for each variable separately. Unfortunately, our list of variables is too long, so we need to break it into pieces and plot the residuals that way.
+
+Subset 1:
+```{r}
+# Selecting the variables for first round
+variables_of_interest_subset_1 <- c("avg_bed", "tract_homevalue_2020", "tract_medage_2020", "tract_medincome_2020", 
+                            "tract_medincome_2010", "medincome_change_2010_2015",
+                            "medincome_change_2015_2020", "medincome_change_2010_2020", "foreclosure_pc_2010")
+```
+
+Subset 2:
+```{r}
+variables_of_interest_subset_2 <- c( 
+                            "pct_built_2020_later", "pct_built_2010_2019", "pct_built_2000_2009", 
+                            "pct_built_1990_1999", "pct_built_1980_1989", "pct_built_1970_1979", 
+                            "pct_built_pre_1960", "pct_0_bd", "pct_1_bd", "pct_2_bd", "pct_3_bd", 
+                            "pct_4_more_bd")
+```
+
+Subset 3:
+```{r}
+variables_of_interest_subset_3 <- c("poverty_2010", "poverty_2020", "nhwhite_2010", "nhwhite_2020", 
+
+                            "poverty_change_2010_2020","nhwhite_change_2010_2020", "pop_change_pct")
+```
+
+Subset 4:
+```{r}
+variables_of_interest_subset_4 <- c(
+                            "mortgaged_2010", "mortgaged_2015", "mortgaged_2020", "ownoccupied_2010", 
+                            "ownoccupied_2015", "ownoccupied_2020", "mortgage_change_2010_2015", 
+                            "mortgage_change_2015_2020", "mortgage_change_2010_2020","ownoccupied_change_2010_2015",                             "ownoccupied_change_2015_2020", "ownoccupied_change_2010_2020")
+```
+
+
+
+Now we can plot the residuals using quantile-quantile plots to assess whether the residuals are normally distributed.
+
+Subset 1:
+
+```{r}
+# Set up the plotting grid
+par(mfrow=c(3, 4))  # 3 rows, 4 columns for the plots
+par(mar=c(3, 3, 2, 1))  # Adjust margins
+
+# Loop through each variable in the subset
+for (variable in variables_of_interest_subset_1) {
+  # Perform linear regression
+  model <- lm(foreclosure_pc_2020 ~ ., data = pg_foreclosures_train[, c(variable, "foreclosure_pc_2020")])
+  
+  # Compute residuals
+  residuals <- resid(model)
+  
+  # Plot Q-Q normal plot
+  qqnorm(residuals, main = paste("Q-Q Normal plot for", variable))
+  qqline(residuals)  # Add a reference line
+  
+}
+```
+Subset 2:
+```{r}
+# Set up the plotting grid
+par(mfrow=c(3, 4))  # 3 rows, 4 columns for the plots
+par(mar=c(3, 3, 2, 1))  # Adjust margins
+
+# Loop through each variable in the subset
+for (variable in variables_of_interest_subset_2) {
+  # Perform linear regression
+  model <- lm(foreclosure_pc_2020 ~ ., data = pg_foreclosures_train[, c(variable, "foreclosure_pc_2020")])
+  
+  # Compute residuals
+  residuals <- resid(model)
+  
+  # Plot Q-Q normal plot
+  qqnorm(residuals, main = paste("Q-Q Normal plot for", variable))
+  qqline(residuals)  # Add a reference line
+  
+}
+```
+Subset 3:
+```{r}
+# Set up the plotting grid
+par(mfrow=c(3, 4))  # 3 rows, 4 columns for the plots
+par(mar=c(3, 3, 2, 1))  # Adjust margins
+
+# Loop through each variable in the subset
+for (variable in variables_of_interest_subset_3) {
+  # Perform linear regression
+  model <- lm(foreclosure_pc_2020 ~ ., data = pg_foreclosures_train[, c(variable, "foreclosure_pc_2020")])
+  
+  # Compute residuals
+  residuals <- resid(model)
+  
+  # Plot Q-Q normal plot
+  qqnorm(residuals, main = paste("Q-Q Normal plot for", variable))
+  qqline(residuals)  # Add a reference line
+  
+}
+```
+Subset 4:
+```{r}
+# Set up the plotting grid
+par(mfrow=c(3, 4))  # 3 rows, 4 columns for the plots
+par(mar=c(3, 3, 2, 1))  # Adjust margins
+
+# Loop through each variable in the subset
+for (variable in variables_of_interest_subset_4) {
+  # Perform linear regression
+  model <- lm(foreclosure_pc_2020 ~ ., data = pg_foreclosures_train[, c(variable, "foreclosure_pc_2020")])
+  
+  # Compute residuals
+  residuals <- resid(model)
+  
+  # Plot Q-Q normal plot
+  qqnorm(residuals, main = paste("Q-Q Normal plot for", variable))
+  qqline(residuals)  # Add a reference line
+  
+}
+```
+Each set of residuals appears to be roughly normally distributed around 0.
+
+Next, we can use the trained models to predict on our testing data. We will show the results together with confidence and prediction bands [NOT YET] and prediction accuracy using (1) the correlation between the predicted and real values and (2) the mean square error between the two.
+
+```{r}
+# Initialize empty vectors to store correlation coefficients and mean squared errors
+correlation_coeffs <- vector()
+mean_squared_errors <- vector()
+
+# Loop through each variable in variables_of_interest_subset_1
+for (variable in variables_of_interest_subset_1) {
+  # Select the variable and the target variable in the training and testing data frames
+  train_data <- pg_foreclosures_train[, c(variable, "foreclosure_pc_2020")]
+  test_data <- pg_foreclosures_test[, c(variable, "foreclosure_pc_2020")]
+  
+  # Remove rows with missing values
+  train_data <- na.omit(train_data)
+  test_data <- na.omit(test_data)
+  
+  # Perform univariate linear regression
+  model <- lm(foreclosure_pc_2020 ~ ., data = train_data)
+  
+  # Use the trained model to predict on testing data and obtain confidence intervals
+  predictions <- predict(model, newdata = test_data, interval = "prediction", level = 0.95)
+  
+  # Plot predicted values vs. independent variable values
+  plot(test_data[[variable]], test_data$foreclosure_pc_2020,
+       main = paste("Actual vs. Predicted for", variable),
+       xlab = paste("Values of", variable),
+       ylab = "Actual Values of foreclosure_pc_2020")
+  
+  # Add regression line
+  abline(model, col = "red") 
+  
+  # Plot confidence bands
+  matlines(x = test_data[[variable]], 
+           y = predictions[, c("upr", "lwr")], 
+           lty = c(2, 2), col = "blue")
+  
+  # Plot prediction bands
+  matlines(x = test_data[[variable]], 
+           y = predictions[, c("fit", "upr", "lwr")], 
+           lty = c(1, 2, 2), col = c("black", "black", "black"))
+  
+  # Calculate correlation coefficient and mean squared error
+  correlation_coeff <- cor(test_data$foreclosure_pc_2020, predictions[, "fit"])
+  mean_squared_error <- mean((predictions[, "fit"] - test_data$foreclosure_pc_2020)^2)
+  
+  # Store correlation coefficient and mean squared error
+  correlation_coeffs <- c(correlation_coeffs, correlation_coeff)
+  mean_squared_errors <- c(mean_squared_errors, mean_squared_error)
+  
+  # Print correlation coefficient and mean squared error
+  cat("Variable:", variable, "\n")
+  cat("Correlation on Testing Data:", correlation_coeff, "\n")
+  cat("Mean Square Error on Testing Data:", mean_squared_error, "\n")
+  cat("\n")
+}
+
+# Print overall summary of correlation coefficients and mean squared errors
+cat("Summary of Correlation Coefficients:\n")
+print(correlation_coeffs)
+cat("\n")
+cat("Summary of Mean Squared Errors:\n")
+print(mean_squared_errors)
+
+```
+
+```{r}
+# Initialize empty vectors to store correlation coefficients and mean squared errors
+correlation_coeffs <- vector()
+mean_squared_errors <- vector()
+
+# Loop through each variable in variables_of_interest_subset_2
+for (variable in variables_of_interest_subset_2) {
+  # Select the variable and the target variable in the training and testing data frames
+  train_data <- pg_foreclosures_train[, c(variable, "foreclosure_pc_2020")]
+  test_data <- pg_foreclosures_test[, c(variable, "foreclosure_pc_2020")]
+  
+  # Remove rows with missing values
+  train_data <- na.omit(train_data)
+  test_data <- na.omit(test_data)
+  
+  # Perform univariate linear regression
+  model <- lm(foreclosure_pc_2020 ~ ., data = train_data)
+  
+  # Use the trained model to predict on testing data and obtain confidence intervals
+  predictions <- predict(model, newdata = test_data, interval = "prediction", level = 0.95)
+  
+  # Plot predicted values vs. independent variable values
+  plot(test_data[[variable]], test_data$foreclosure_pc_2020,
+       main = paste("Actual vs. Predicted for", variable),
+       xlab = paste("Values of", variable),
+       ylab = "Actual Values of foreclosure_pc_2020")
+  
+  # Add regression line
+  abline(model, col = "red") 
+  
+  # Plot confidence bands
+  matlines(x = test_data[[variable]], 
+           y = predictions[, c("upr", "lwr")], 
+           lty = c(2, 2), col = "blue")
+  
+  # Plot prediction bands
+  matlines(x = test_data[[variable]], 
+           y = predictions[, c("fit", "upr", "lwr")], 
+           lty = c(1, 2, 2), col = c("black", "black", "black"))
+  
+  # Calculate correlation coefficient and mean squared error
+  correlation_coeff <- cor(test_data$foreclosure_pc_2020, predictions[, "fit"])
+  mean_squared_error <- mean((predictions[, "fit"] - test_data$foreclosure_pc_2020)^2)
+  
+  # Store correlation coefficient and mean squared error
+  correlation_coeffs <- c(correlation_coeffs, correlation_coeff)
+  mean_squared_errors <- c(mean_squared_errors, mean_squared_error)
+  
+  # Print correlation coefficient and mean squared error
+  cat("Variable:", variable, "\n")
+  cat("Correlation on Testing Data:", correlation_coeff, "\n")
+  cat("Mean Square Error on Testing Data:", mean_squared_error, "\n")
+  cat("\n")
+}
+
+# Print overall summary of correlation coefficients and mean squared errors
+cat("Summary of Correlation Coefficients:\n")
+print(correlation_coeffs)
+cat("\n")
+cat("Summary of Mean Squared Errors:\n")
+print(mean_squared_errors)
+```
+
+```{r}
+# Initialize empty vectors to store correlation coefficients and mean squared errors
+correlation_coeffs <- vector()
+mean_squared_errors <- vector()
+
+# Loop through each variable in variables_of_interest_subset_3
+for (variable in variables_of_interest_subset_3) {
+  # Select the variable and the target variable in the training and testing data frames
+  train_data <- pg_foreclosures_train[, c(variable, "foreclosure_pc_2020")]
+  test_data <- pg_foreclosures_test[, c(variable, "foreclosure_pc_2020")]
+  
+  # Remove rows with missing values
+  train_data <- na.omit(train_data)
+  test_data <- na.omit(test_data)
+  
+  # Perform univariate linear regression
+  model <- lm(foreclosure_pc_2020 ~ ., data = train_data)
+  
+  # Use the trained model to predict on testing data and obtain confidence intervals
+  predictions <- predict(model, newdata = test_data, interval = "prediction", level = 0.95)
+  
+  # Plot predicted values vs. independent variable values
+  plot(test_data[[variable]], test_data$foreclosure_pc_2020,
+       main = paste("Actual vs. Predicted for", variable),
+       xlab = paste("Values of", variable),
+       ylab = "Actual Values of foreclosure_pc_2020")
+  
+  # Add regression line
+  abline(model, col = "red") 
+  
+  # Plot confidence bands
+  matlines(x = test_data[[variable]], 
+           y = predictions[, c("upr", "lwr")], 
+           lty = c(2, 2), col = "blue")
+  
+  # Plot prediction bands
+  matlines(x = test_data[[variable]], 
+           y = predictions[, c("fit", "upr", "lwr")], 
+           lty = c(1, 2, 2), col = c("black", "black", "black"))
+  
+  # Calculate correlation coefficient and mean squared error
+  correlation_coeff <- cor(test_data$foreclosure_pc_2020, predictions[, "fit"])
+  mean_squared_error <- mean((predictions[, "fit"] - test_data$foreclosure_pc_2020)^2)
+  
+  # Store correlation coefficient and mean squared error
+  correlation_coeffs <- c(correlation_coeffs, correlation_coeff)
+  mean_squared_errors <- c(mean_squared_errors, mean_squared_error)
+  
+  # Print correlation coefficient and mean squared error
+  cat("Variable:", variable, "\n")
+  cat("Correlation on Testing Data:", correlation_coeff, "\n")
+  cat("Mean Square Error on Testing Data:", mean_squared_error, "\n")
+  cat("\n")
+}
+
+# Print overall summary of correlation coefficients and mean squared errors
+cat("Summary of Correlation Coefficients:\n")
+print(correlation_coeffs)
+cat("\n")
+cat("Summary of Mean Squared Errors:\n")
+print(mean_squared_errors)
+```
+
+```{r}
+# Initialize empty vectors to store correlation coefficients and mean squared errors
+correlation_coeffs <- vector()
+mean_squared_errors <- vector()
+
+# Loop through each variable in variables_of_interest_subset_4
+for (variable in variables_of_interest_subset_4) {
+  # Select the variable and the target variable in the training and testing data frames
+  train_data <- pg_foreclosures_train[, c(variable, "foreclosure_pc_2020")]
+  test_data <- pg_foreclosures_test[, c(variable, "foreclosure_pc_2020")]
+  
+  # Remove rows with missing values
+  train_data <- na.omit(train_data)
+  test_data <- na.omit(test_data)
+  
+  # Perform univariate linear regression
+  model <- lm(foreclosure_pc_2020 ~ ., data = train_data)
+  
+  # Use the trained model to predict on testing data and obtain confidence intervals
+  predictions <- predict(model, newdata = test_data, interval = "prediction", level = 0.95)
+  
+  # Plot predicted values vs. independent variable values
+  plot(test_data[[variable]], test_data$foreclosure_pc_2020,
+       main = paste("Actual vs. Predicted for", variable),
+       xlab = paste("Values of", variable),
+       ylab = "Actual Values of foreclosure_pc_2020")
+  
+  # Add regression line
+  abline(model, col = "red") 
+  
+  # Plot confidence bands
+  matlines(x = test_data[[variable]], 
+           y = predictions[, c("upr", "lwr")], 
+           lty = c(2, 2), col = "blue")
+  
+  # Plot prediction bands
+  matlines(x = test_data[[variable]], 
+           y = predictions[, c("fit", "upr", "lwr")], 
+           lty = c(1, 2, 2), col = c("black", "black", "black"))
+  
+  # Calculate correlation coefficient and mean squared error
+  correlation_coeff <- cor(test_data$foreclosure_pc_2020, predictions[, "fit"])
+  mean_squared_error <- mean((predictions[, "fit"] - test_data$foreclosure_pc_2020)^2)
+  
+  # Store correlation coefficient and mean squared error
+  correlation_coeffs <- c(correlation_coeffs, correlation_coeff)
+  mean_squared_errors <- c(mean_squared_errors, mean_squared_error)
+  
+  # Print correlation coefficient and mean squared error
+  cat("Variable:", variable, "\n")
+  cat("Correlation on Testing Data:", correlation_coeff, "\n")
+  cat("Mean Square Error on Testing Data:", mean_squared_error, "\n")
+  cat("\n")
+}
+
+# Print overall summary of correlation coefficients and mean squared errors
+cat("Summary of Correlation Coefficients:\n")
+print(correlation_coeffs)
+cat("\n")
+cat("Summary of Mean Squared Errors:\n")
+print(mean_squared_errors)
+```
+
+
+
+3. Multivariate regression:
+
+We need to do a preliminary test of the correlations between each of our independent variables. This will help us identify collinearity, which would negatively impact the accuracy of our model.
+
+```{r}
+# Calculating the correlation matrix
+correlation_matrix <- cor(pg_foreclosures_per_tract[variables_of_interest])
+```
+
+Using that correlation matrix, we can directly compute which variables have a correlation coefficient of over 0.8. 
+```{r}
+# Set a correlation threshold
+threshold <- 0.85
+
+# Find highly correlated variable pairs
+highly_correlated <- which(correlation_matrix > threshold & correlation_matrix < 1, arr.ind = TRUE)
+
+# Print highly correlated variable pairs
+for (i in 1:nrow(highly_correlated)) {
+  var1 <- rownames(correlation_matrix)[highly_correlated[i, 1]]
+  var2 <- colnames(correlation_matrix)[highly_correlated[i, 2]]
+  corr <- correlation_matrix[highly_correlated[i, 1], highly_correlated[i, 2]]
+  cat("Variables", var1, "and", var2, "are highly correlated (correlation =", corr, ")\n")
+}
+```
+
+Both to answer the main questions and to determine which of the collinear variables to keep in our "variables of interest" list (or version of said list), we can test the correlation coefficients of our independent variables/our dependent variable.
+
+```{r}
+# Selecting the variables of interest (excluding foreclosure_pc_2020)
+variables_of_interest <- c("avg_bed", "tract_homevalue_2020", "tract_medage_2020", "tract_medincome_2020", 
+                            "tract_medincome_2010", "foreclosure_pc_2010", 
+                            "pct_built_2020_later", "pct_built_2010_2019", "pct_built_2000_2009", 
+                            "pct_built_1990_1999", "pct_built_1980_1989", "pct_built_1970_1979", 
+                            "pct_built_pre_1960", "pct_0_bd", "pct_1_bd", "pct_2_bd", "pct_3_bd", 
+                            "pct_4_more_bd", "poverty_2010", "poverty_2020", "nhwhite_2010", "nhwhite_2020", 
+                            "mortgaged_2010", "mortgaged_2015", "mortgaged_2020", "ownoccupied_2010", 
+                            "ownoccupied_2015", "ownoccupied_2020", "mortgage_change_2010_2015", 
+                            "mortgage_change_2015_2020", "mortgage_change_2010_2020","ownoccupied_change_2010_2015",                             "ownoccupied_change_2015_2020", "ownoccupied_change_2010_2020",
+                            "poverty_change_2010_2020","nhwhite_change_2010_2020","medincome_change_2010_2015",
+                            "medincome_change_2015_2020", "medincome_change_2010_2020", "pop_change_pct")
+
+# Calculate the correlation matrix
+correlation_matrix <- cor(pg_foreclosures_per_tract[variables_of_interest], pg_foreclosures_per_tract$foreclosure_pc_2020)
+
+# Print the correlation coefficients
+print(correlation_matrix)
+```
+
+
+We can also visualize these correlation coefficients as a bar chart:
+```{r}
+# Convert the correlation coefficients to a vector
+correlation_vector <- as.vector(correlation_matrix)
+
+# Exclude the diagonal (correlation of a variable with itself)
+correlation_vector <- correlation_vector[!is.na(correlation_vector) & correlation_vector != 1]
+
+# Get the names of variables
+variable_names <- names(pg_foreclosures_per_tract[variables_of_interest])
+
+# Plot the correlations as a bar plot with variable names as labels
+barplot(correlation_vector, 
+        main = "Correlation of independent variables with foreclosures per capita",
+        xlab = "",
+        ylab = "Correlation Coefficient",
+        names.arg = variable_names,
+        las = 2, # Rotate labels vertically
+        cex.names = 0.7) # Adjust label size
+```
+
+Next, we can define a set of variables to test that does not include collinear variables and that prioritize the variables from collinear sets (nhwhite_2020, for instance) with the highest correlation coefficient within their set.
+
+```{r}
+# Selecting test variables
+test_variables_1 <- c("avg_bed", "tract_homevalue_2020", "tract_medage_2020", "tract_medincome_2020",   "foreclosure_pc_2010", "pct_built_2020_later", "pct_built_2010_2019", "pct_built_2000_2009",  "pct_built_1990_1999", "pct_built_1980_1989", "pct_built_1970_1979", "pct_built_pre_1960", "poverty_2020", "nhwhite_2020", "mortgaged_2010", "mortgage_change_2010_2015", "poverty_change_2010_2020","nhwhite_change_2010_2020","medincome_change_2010_2015", "medincome_change_2015_2020", "medincome_change_2010_2020", "pop_change_pct")
+```
+
+We can now run that list of variables through a linear regression model. 
+```{r}
+# Convert tract_number to character before splitting the data
+pg_foreclosures_per_tract$tract_number <- as.character(pg_foreclosures_per_tract$tract_number)
+
+# Split the data into training and testing sets
+set.seed(123) # for reproducibility
+train_indices <- createDataPartition(pg_foreclosures_per_tract$foreclosure_pc_2020, p = 0.8, list = FALSE)
+train_data_multivariate_1 <- pg_foreclosures_per_tract[train_indices, ]
+test_data_multivariate_1 <- pg_foreclosures_per_tract[-train_indices, ]
+
+# Train the linear regression model on the training data
+lm_model <- lm(foreclosure_pc_2020 ~ ., data = train_data_multivariate_1[, c("foreclosure_pc_2020", test_variables_1)])
+
+# Use the trained model to predict on the testing data
+predicted_values <- predict(lm_model, newdata = test_data_multivariate_1[, test_variables_1])
+
+# Calculate the correlation between the predicted and real values
+correlation <- cor(predicted_values, test_data_multivariate_1$foreclosure_pc_2020)
+
+# Calculate the mean squared error between the predicted and real values
+mse <- mean((predicted_values - test_data_multivariate_1$foreclosure_pc_2020)^2)
+
+# Obtain coefficients for each feature
+coefficients <- coef(lm_model)
+print(coefficients)
+
+# Identify the most predictive features
+# Absolute values of coefficients can be considered for importance
+# Higher absolute values indicate more influence on the prediction
+absolute_coefficients <- abs(coefficients[-1]) # Exclude intercept
+top_predictive_features <- names(absolute_coefficients)[order(-absolute_coefficients)][1:5] # Select top 5 features
+
+# Print the most predictive features, correlation, and mean squared error
+cat("Most predictive features:", top_predictive_features, "\n")
+cat("Correlation between predicted and real values:", correlation, "\n")
+cat("Mean Squared Error:", mse, "\n")
+```
+This is a reasonably strong model, but there is certainly room for improvement.
+
+We can define a different set of test variables, removing mortgage/years built percentages and using the poverty rate from 2010. 
+
+```{r}
+# Selecting test variables
+test_variables_2 <- c("avg_bed", "tract_homevalue_2020", "tract_medage_2020", "tract_medincome_2020",   "foreclosure_pc_2010", "pct_built_2000_2009", "poverty_2010", "nhwhite_2020", "mortgage_change_2010_2020", "poverty_change_2010_2020","nhwhite_change_2010_2020","medincome_change_2010_2015", "medincome_change_2015_2020", "medincome_change_2010_2020", "pop_change_pct")
+```
+
+We run that list of variables through a model:
+
+```{r}
+# Convert tract_number to character before splitting the data
+pg_foreclosures_per_tract$tract_number <- as.character(pg_foreclosures_per_tract$tract_number)
+
+# Split the data into training and testing sets
+set.seed(123) # for reproducibility
+train_indices <- createDataPartition(pg_foreclosures_per_tract$foreclosure_pc_2020, p = 0.8, list = FALSE)
+train_data_multivariate_1 <- pg_foreclosures_per_tract[train_indices, ]
+test_data_multivariate_1 <- pg_foreclosures_per_tract[-train_indices, ]
+
+# Train the linear regression model on the training data
+lm_model <- lm(foreclosure_pc_2020 ~ ., data = train_data_multivariate_1[, c("foreclosure_pc_2020", test_variables_2)])
+
+# Use the trained model to predict on the testing data
+predicted_values <- predict(lm_model, newdata = test_data_multivariate_1[, test_variables_2])
+
+# Calculate the correlation between the predicted and real values
+correlation <- cor(predicted_values, test_data_multivariate_1$foreclosure_pc_2020)
+
+# Calculate the mean squared error between the predicted and real values
+mse <- mean((predicted_values - test_data_multivariate_1$foreclosure_pc_2020)^2)
+
+# Obtain coefficients for each feature
+coefficients <- coef(lm_model)
+print(coefficients)
+
+# Identify the most predictive features
+# Absolute values of coefficients can be considered for importance
+# Higher absolute values indicate more influence on the prediction
+absolute_coefficients <- abs(coefficients[-1]) # Exclude intercept
+top_predictive_features <- names(absolute_coefficients)[order(-absolute_coefficients)][1:5] # Select top 5 features
+
+# Print the most predictive features, correlation, and mean squared error
+cat("Most predictive features:", top_predictive_features, "\n")
+cat("Correlation between predicted and real values:", correlation, "\n")
+cat("Mean Squared Error:", mse, "\n")
+```
+This model is slightly less predictive, but we no longer get a warning about a rank-deficient fit.
+
+We can try again with yet another set of variables, removing avg_bed and replacing it with mortgaged_2010. 
+
+```{r}
+# Selecting test variables
+test_variables_3 <- c("mortgaged_2010", "tract_homevalue_2020", "tract_medage_2020", "tract_medincome_2020",   "foreclosure_pc_2010", "pct_built_2000_2009", "poverty_2010", "nhwhite_2020", "mortgage_change_2010_2020", "poverty_change_2010_2020","nhwhite_change_2010_2020","medincome_change_2010_2015", "medincome_change_2015_2020", "medincome_change_2010_2020", "pop_change_pct")
+```
+
+We can run that through a model:
+```{r}
+# Convert tract_number to character before splitting the data
+pg_foreclosures_per_tract$tract_number <- as.character(pg_foreclosures_per_tract$tract_number)
+
+# Split the data into training and testing sets
+set.seed(123) # for reproducibility
+train_indices <- createDataPartition(pg_foreclosures_per_tract$foreclosure_pc_2020, p = 0.8, list = FALSE)
+train_data_multivariate_1 <- pg_foreclosures_per_tract[train_indices, ]
+test_data_multivariate_1 <- pg_foreclosures_per_tract[-train_indices, ]
+
+# Train the linear regression model on the training data
+lm_model <- lm(foreclosure_pc_2020 ~ ., data = train_data_multivariate_1[, c("foreclosure_pc_2020", test_variables_3)])
+
+# Use the trained model to predict on the testing data
+predicted_values <- predict(lm_model, newdata = test_data_multivariate_1[, test_variables_3])
+
+# Calculate the correlation between the predicted and real values
+correlation <- cor(predicted_values, test_data_multivariate_1$foreclosure_pc_2020)
+
+# Calculate the mean squared error between the predicted and real values
+mse <- mean((predicted_values - test_data_multivariate_1$foreclosure_pc_2020)^2)
+
+# Obtain coefficients for each feature
+coefficients <- coef(lm_model)
+print(coefficients)
+
+# Identify the most predictive features
+# Absolute values of coefficients can be considered for importance
+# Higher absolute values indicate more influence on the prediction
+absolute_coefficients <- abs(coefficients[-1]) # Exclude intercept
+top_predictive_features <- names(absolute_coefficients)[order(-absolute_coefficients)][1:5] # Select top 5 features
+
+# Print the most predictive features, correlation, and mean squared error
+cat("Most predictive features:", top_predictive_features, "\n")
+cat("Correlation between predicted and real values:", correlation, "\n")
+cat("Mean Squared Error:", mse, "\n")
+```
+So far, this model is the most predictive and does not produce a warning about a rank-deficient fit.
+
+
+4. Regularization:
+
+We perform a Lasso regression for each of the variables of interest using a loop:
+
+```{r}
+# Set the regularization parameter
+lambda <- 0.2
+
+for (variable in variables_of_interest) {
+    # Prepare the data
+    X <- model.matrix(foreclosure_pc_2020 ~ ., data = pg_foreclosures_train[, c(variables_of_interest, "foreclosure_pc_2020")])[, -1]
+    y <- pg_foreclosures_train$foreclosure_pc_2020
+    
+    # Fit the Lasso regression model
+    lasso_model <- glmnet(X, y, alpha = 1, lambda = lambda)
+    
+    # Extract coefficients
+    coef_idx <- which(colnames(X) == variable)
+    coefficient <- coef(lasso_model)[coef_idx]
+    
+    # Check if the coefficient is non-zero
+    is_predictive <- ifelse(abs(coefficient) > 0, "Yes", "No")
+    
+    # Compute residuals
+    residuals <- y - predict(lasso_model, newx = X)
+    
+    # Compute correlation between predicted and real values
+    correlation <- cor(predict(lasso_model, newx = X), y)
+    
+    # Compute mean square error
+    mse <- mean(residuals^2)
+    
+    # Print results
+    cat("Variable:", variable, "\n")
+    cat("Coefficient:", coefficient, "\n")
+    cat("Is it a predictive feature?:", is_predictive, "\n")
+    cat("Correlation:", correlation, "\n")
+    cat("Mean Square Error:", mse, "\n")
+    cat("\n")
+}
+```
+
+We plot the residuals for each variable:
+
+Subset 1:
+
+```{r}
+# Set the lambda (regularization) parameter
+lambda <- 0.2
+
+for (variable in variables_of_interest_subset_1) {
+    # Prepare the data
+    X <- model.matrix(foreclosure_pc_2020 ~ ., data = pg_foreclosures_train[, c(variables_of_interest, "foreclosure_pc_2020")])[, -1]
+    y <- pg_foreclosures_train$foreclosure_pc_2020
+    
+    # Fit the Lasso regression model
+    lasso_model <- glmnet(X, y, alpha = 1, lambda = lambda)
+    
+    # Compute residuals
+    residuals <- y - predict(lasso_model, newx = X)
+    
+    # Plot Q-Q plot of residuals
+    qqnorm(residuals, main = paste("Q-Q Plot of Residuals for", variable), ylab = "Residuals")
+    qqline(residuals)
+}
+```
+Subset 2:
+```{r}
+# Set the lambda (regularization) parameter
+lambda <- 0.2
+
+for (variable in variables_of_interest_subset_2) {
+    # Prepare the data
+    X <- model.matrix(foreclosure_pc_2020 ~ ., data = pg_foreclosures_train[, c(variables_of_interest, "foreclosure_pc_2020")])[, -1]
+    y <- pg_foreclosures_train$foreclosure_pc_2020
+    
+    # Fit the Lasso regression model
+    lasso_model <- glmnet(X, y, alpha = 1, lambda = lambda)
+    
+    # Compute residuals
+    residuals <- y - predict(lasso_model, newx = X)
+    
+    # Plot Q-Q plot of residuals
+    qqnorm(residuals, main = paste("Q-Q Plot of Residuals for", variable), ylab = "Residuals")
+    qqline(residuals)
+}
+```
+Subset 3:
+
+```{r}
+# Set the lambda (regularization) parameter
+lambda <- 0.2
+
+for (variable in variables_of_interest_subset_3) {
+    # Prepare the data
+    X <- model.matrix(foreclosure_pc_2020 ~ ., data = pg_foreclosures_train[, c(variables_of_interest, "foreclosure_pc_2020")])[, -1]
+    y <- pg_foreclosures_train$foreclosure_pc_2020
+    
+    # Fit the Lasso regression model
+    lasso_model <- glmnet(X, y, alpha = 1, lambda = lambda)
+    
+    # Compute residuals
+    residuals <- y - predict(lasso_model, newx = X)
+    
+    # Plot Q-Q plot of residuals
+    qqnorm(residuals, main = paste("Q-Q Plot of Residuals for", variable), ylab = "Residuals")
+    qqline(residuals)
+}
+```
+Subset 4:
+```{r}
+# Set the lambda (regularization) parameter
+lambda <- 0.2
+
+for (variable in variables_of_interest_subset_1) {
+    # Prepare the data
+    X <- model.matrix(foreclosure_pc_2020 ~ ., data = pg_foreclosures_train[, c(variables_of_interest, "foreclosure_pc_2020")])[, -1]
+    y <- pg_foreclosures_train$foreclosure_pc_2020
+    
+    # Fit the Lasso regression model
+    lasso_model <- glmnet(X, y, alpha = 1, lambda = lambda)
+    
+    # Compute residuals
+    residuals <- y - predict(lasso_model, newx = X)
+    
+    # Plot Q-Q plot of residuals
+    qqnorm(residuals, main = paste("Q-Q Plot of Residuals for", variable), ylab = "Residuals")
+    qqline(residuals)
+}
+```
+We can now compare the Lasso model predictions to our actual values:
+
+Subset 1:
+
+```{r}
+# Set the lambda (regularization) parameter
+lambda <- 0.2
+
+# Initialize vectors to store correlation coefficients and mean squared errors
+correlation_coefficients <- numeric(length(variables_of_interest_subset_1))
+mean_squared_errors <- numeric(length(variables_of_interest_subset_1))
+
+# Loop through each variable in variables_of_interest_subset_2
+for (i in 1:length(variables_of_interest_subset_1)) {
+    variable <- variables_of_interest_subset_1[i]
+    
+    # Prepare the data for Lasso regression
+    X_train <- as.matrix(pg_foreclosures_train[, variable, drop = FALSE])  # Assuming you have a training set
+    y_train <- pg_foreclosures_train$foreclosure_pc_2020  # Assuming 'foreclosure_pc_2020' is the target variable
+    
+    # Check if X_train has only one column, if so, convert it to a matrix with multiple columns
+    if (ncol(X_train) == 1) {
+        X_train <- cbind(1, X_train)  # Assuming you want to include an intercept term
+    }
+    
+    # Fit the Lasso regression model
+    lasso_model <- glmnet(X_train, y_train, alpha = 1, lambda = lambda)
+    
+    # Prepare the data for prediction
+    X_test <- as.matrix(pg_foreclosures_test[, variable, drop = FALSE])
+    
+    # Check if X_test has only one column, if so, convert it to a matrix with multiple columns
+    if (ncol(X_test) == 1) {
+        X_test <- cbind(1, X_test)  # Include an intercept term
+    }
+    
+    # Predict on testing data
+    prediction <- predict(lasso_model, newx = X_test, s = lambda)
+    
+    # Store the prediction
+    predictions <- prediction
+    
+    # Plot predicted vs. actual values
+    plot(pg_foreclosures_test$foreclosure_pc_2020, predictions, 
+         main = paste("Predicted vs. Actual for", variable),
+         xlab = "Actual Values", ylab = "Predicted Values", 
+         ylim = range(c(predictions))) 
+    abline(0, 1, col = "red") # Add a diagonal line for reference
+    
+    # Calculate correlation between predicted and actual values
+    correlation_test <- cor(predictions, pg_foreclosures_test$foreclosure_pc_2020)
+    
+    # Calculate mean square error
+    mse_test <- mean((predictions - pg_foreclosures_test$foreclosure_pc_2020)^2)
+    
+    # Print correlation and mean square error
+    cat("Variable:", variable, "\n")
+    cat("Correlation on Testing Data:", correlation_test, "\n")
+    cat("Mean Square Error on Testing Data:", mse_test, "\n")
+    cat("\n")
+}
+
+```
+
+Subset 2:
+```{r}
+# Set the lambda (regularization) parameter
+lambda <- 0.2
+
+# Initialize vectors to store correlation coefficients and mean squared errors
+correlation_coefficients <- numeric(length(variables_of_interest_subset_2))
+mean_squared_errors <- numeric(length(variables_of_interest_subset_2))
+
+# Loop through each variable in variables_of_interest_subset_2
+for (i in 1:length(variables_of_interest_subset_2)) {
+    variable <- variables_of_interest_subset_2[i]
+    
+    # Prepare the data for Lasso regression
+    X_train <- as.matrix(pg_foreclosures_train[, variable, drop = FALSE])  # Assuming you have a training set
+    y_train <- pg_foreclosures_train$foreclosure_pc_2020  # Assuming 'foreclosure_pc_2020' is the target variable
+    
+    # Check if X_train has only one column, if so, convert it to a matrix with multiple columns
+    if (ncol(X_train) == 1) {
+        X_train <- cbind(1, X_train)  # Assuming you want to include an intercept term
+    }
+    
+    # Fit the Lasso regression model
+    lasso_model <- glmnet(X_train, y_train, alpha = 1, lambda = lambda)
+    
+    # Prepare the data for prediction
+    X_test <- as.matrix(pg_foreclosures_test[, variable, drop = FALSE])
+    
+    # Check if X_test has only one column, if so, convert it to a matrix with multiple columns
+    if (ncol(X_test) == 1) {
+        X_test <- cbind(1, X_test)  # Include an intercept term
+    }
+    
+    # Predict on testing data
+    prediction <- predict(lasso_model, newx = X_test, s = lambda)
+    
+    # Store the prediction
+    predictions <- prediction
+    
+    # Plot predicted vs. actual values with confidence bands
+    plot(pg_foreclosures_test$foreclosure_pc_2020, predictions, 
+         main = paste("Predicted vs. Actual for", variable),
+         xlab = "Actual Values", ylab = "Predicted Values", 
+         ylim = range(c(predictions))) 
+    abline(0, 1, col = "red") # Add a diagonal line for reference
+    
+    # Calculate correlation between predicted and actual values
+    correlation_test <- cor(predictions, pg_foreclosures_test$foreclosure_pc_2020)
+    
+    # Calculate mean square error
+    mse_test <- mean((predictions - pg_foreclosures_test$foreclosure_pc_2020)^2)
+    
+    # Print correlation and mean square error
+    cat("Variable:", variable, "\n")
+    cat("Correlation on Testing Data:", correlation_test, "\n")
+    cat("Mean Square Error on Testing Data:", mse_test, "\n")
+    cat("\n")
+}
+
+```
+
+Subset 3: 
+
+```{r}
+# Set the lambda (regularization) parameter
+lambda <- 0.2
+
+# Initialize vectors to store correlation coefficients and mean squared errors
+correlation_coefficients <- numeric(length(variables_of_interest_subset_3))
+mean_squared_errors <- numeric(length(variables_of_interest_subset_3))
+
+# Loop through each variable in variables_of_interest_subset_2
+for (i in 1:length(variables_of_interest_subset_3)) {
+    variable <- variables_of_interest_subset_3[i]
+    
+    # Prepare the data for Lasso regression
+    X_train <- as.matrix(pg_foreclosures_train[, variable, drop = FALSE])  # Assuming you have a training set
+    y_train <- pg_foreclosures_train$foreclosure_pc_2020  # Assuming 'foreclosure_pc_2020' is the target variable
+    
+    # Check if X_train has only one column, if so, convert it to a matrix with multiple columns
+    if (ncol(X_train) == 1) {
+        X_train <- cbind(1, X_train)  # Assuming you want to include an intercept term
+    }
+    
+    # Fit the Lasso regression model
+    lasso_model <- glmnet(X_train, y_train, alpha = 1, lambda = lambda)
+    
+    # Prepare the data for prediction
+    X_test <- as.matrix(pg_foreclosures_test[, variable, drop = FALSE])
+    
+    # Check if X_test has only one column, if so, convert it to a matrix with multiple columns
+    if (ncol(X_test) == 1) {
+        X_test <- cbind(1, X_test)  # Include an intercept term
+    }
+    
+    # Predict on testing data
+    prediction <- predict(lasso_model, newx = X_test, s = lambda)
+    
+    # Store the prediction
+    predictions <- prediction
+    
+    # Plot predicted vs. actual values with confidence bands
+    plot(pg_foreclosures_test$foreclosure_pc_2020, predictions, 
+         main = paste("Predicted vs. Actual for", variable),
+         xlab = "Actual Values", ylab = "Predicted Values", 
+         ylim = range(c(predictions))) 
+    abline(0, 1, col = "red") # Add a diagonal line for reference
+    
+    # Calculate correlation between predicted and actual values
+    correlation_test <- cor(predictions, pg_foreclosures_test$foreclosure_pc_2020)
+    
+    # Calculate mean square error
+    mse_test <- mean((predictions - pg_foreclosures_test$foreclosure_pc_2020)^2)
+    
+    # Print correlation and mean square error
+    cat("Variable:", variable, "\n")
+    cat("Correlation on Testing Data:", correlation_test, "\n")
+    cat("Mean Square Error on Testing Data:", mse_test, "\n")
+    cat("\n")
+}
+
+```
+
+Subset 4: 
+
+```{r}
+# Set the lambda (regularization) parameter
+lambda <- 0.2
+
+# Initialize vectors to store correlation coefficients and mean squared errors
+correlation_coefficients <- numeric(length(variables_of_interest_subset_4))
+mean_squared_errors <- numeric(length(variables_of_interest_subset_4))
+
+# Loop through each variable in variables_of_interest_subset_2
+for (i in 1:length(variables_of_interest_subset_4)) {
+    variable <- variables_of_interest_subset_4[i]
+    
+    # Prepare the data for Lasso regression
+    X_train <- as.matrix(pg_foreclosures_train[, variable, drop = FALSE])  # Assuming you have a training set
+    y_train <- pg_foreclosures_train$foreclosure_pc_2020  # Assuming 'foreclosure_pc_2020' is the target variable
+    
+    # Check if X_train has only one column, if so, convert it to a matrix with multiple columns
+    if (ncol(X_train) == 1) {
+        X_train <- cbind(1, X_train)  # Assuming you want to include an intercept term
+    }
+    
+    # Fit the Lasso regression model
+    lasso_model <- glmnet(X_train, y_train, alpha = 1, lambda = lambda)
+    
+    # Prepare the data for prediction
+    X_test <- as.matrix(pg_foreclosures_test[, variable, drop = FALSE])
+    
+    # Check if X_test has only one column, if so, convert it to a matrix with multiple columns
+    if (ncol(X_test) == 1) {
+        X_test <- cbind(1, X_test)  # Include an intercept term
+    }
+    
+    # Predict on testing data
+    prediction <- predict(lasso_model, newx = X_test, s = lambda)
+    
+    # Store the prediction
+    predictions <- prediction
+    
+    # Plot predicted vs. actual values with confidence bands
+    plot(pg_foreclosures_test$foreclosure_pc_2020, predictions, 
+         main = paste("Predicted vs. Actual for", variable),
+         xlab = "Actual Values", ylab = "Predicted Values", 
+         ylim = range(c(predictions))) 
+    abline(0, 1, col = "red") # Add a diagonal line for reference
+    
+    # Calculate correlation between predicted and actual values
+    correlation_test <- cor(predictions, pg_foreclosures_test$foreclosure_pc_2020)
+    
+    # Calculate mean square error
+    mse_test <- mean((predictions - pg_foreclosures_test$foreclosure_pc_2020)^2)
+    
+    # Print correlation and mean square error
+    cat("Variable:", variable, "\n")
+    cat("Correlation on Testing Data:", correlation_test, "\n")
+    cat("Mean Square Error on Testing Data:", mse_test, "\n")
+    cat("\n")
+}
+
+```
+
+
+We can also repeat our most successful linear regression model using a Lasso model:
+
+```{r}
+# Convert tract_number to character before splitting the data
+pg_foreclosures_per_tract$tract_number <- as.character(pg_foreclosures_per_tract$tract_number)
+
+# Split the data into training and testing sets
+set.seed(123) # for reproducibility
+train_indices <- createDataPartition(pg_foreclosures_per_tract$foreclosure_pc_2020, p = 0.8, list = FALSE)
+train_data_multivariate_1 <- pg_foreclosures_per_tract[train_indices, ]
+test_data_multivariate_1 <- pg_foreclosures_per_tract[-train_indices, ]
+
+# Define predictor variables
+test_variables_3 <- c("ownoccupied_2010", "tract_homevalue_2020", "tract_medage_2020", "tract_medincome_2020",   "foreclosure_pc_2010", "pct_built_2000_2009", "poverty_2010", "nhwhite_2020", "mortgage_change_2010_2020", "poverty_change_2010_2020","nhwhite_change_2010_2020","medincome_change_2010_2015", "medincome_change_2015_2020", "medincome_change_2010_2020", "pop_change_pct")
+
+# Train the Lasso regression model on the training data
+lasso_model <- cv.glmnet(as.matrix(train_data_multivariate_1[, test_variables_3]),
+                         train_data_multivariate_1$foreclosure_pc_2020,
+                         alpha = 1) # Use alpha = 1 for Lasso regression
+
+# Use the trained model to predict on the testing data
+predicted_values <- predict(lasso_model, newx = as.matrix(test_data_multivariate_1[, test_variables_3]),
+                            s = "lambda.min")
+
+# Calculate the correlation between the predicted and real values
+correlation <- cor(predicted_values, test_data_multivariate_1$foreclosure_pc_2020)
+
+# Calculate the mean squared error between the predicted and real values
+mse <- mean((predicted_values - test_data_multivariate_1$foreclosure_pc_2020)^2)
+
+# Obtain coefficients for each feature
+coefficients <- coef(lasso_model, s = "lambda.min")
+print(coefficients)
+
+# Identify the most predictive features
+# Non-zero coefficients indicate predictive features in Lasso regression
+non_zero_coefficients <- coefficients[-1] # Exclude intercept
+top_predictive_features <- names(non_zero_coefficients[non_zero_coefficients != 0]) # Select features with non-zero coefficients
+
+# Print the most predictive features, correlation, and mean squared error
+cat("Most predictive features:", top_predictive_features, "\n")
+cat("Correlation between predicted and real values:", correlation, "\n")
+cat("Mean Squared Error:", mse, "\n")
+```
+When we use a Lasso model, we find *no* "most predictive" features. In practical terms, we can interpret this result as the Lasso algorithm finding that no single feature is dominant in predicting the foreclosure percentages, and the model relies on a combination of features with small contributions from each.
+
+5. Re-sampling: 
+We first need to repeat our univariate linear regression process multiple times with multiple samples to see if we reach the same results.
+
+```{r}
+# Set seed for reproducibility
+set.seed(123)
+
+# Define the number of repetitions
+num_repetitions <- 5
+
+# Loop for repetitions
+for (i in 1:num_repetitions) {
+  # Split data into training and testing datasets (e.g., 80% training, 20% testing)
+  train_indices <- createDataPartition(pg_foreclosures_per_tract$foreclosure_pc_2020, p = 0.7, list = FALSE)
+  pg_foreclosures_train <- pg_foreclosures_per_tract[train_indices, ]
+  pg_foreclosures_test <- pg_foreclosures_per_tract[-train_indices, ]
+
+  for (variable in variables_of_interest) {
+    # Perform linear regression
+    model <- lm(foreclosure_pc_2020 ~ ., data = pg_foreclosures_train[, c(variable, "foreclosure_pc_2020")])
+  
+    # Extract required information
+    intercept <- coef(model)[1]
+    coefficient <- coef(model)[2]
+  
+    # Check if the coefficient is statistically significant
+    p_value <- summary(model)$coefficients[which(rownames(summary(model)$coefficients) == variable), "Pr(>|t|)"]
+    is_predictive <- ifelse(p_value < 0.05, "Yes", "No")
+  
+    # Compute residuals
+    residuals <- resid(model)
+  
+    # Compute correlation between predicted and real values
+    correlation <- cor(predict(model), pg_foreclosures_train$foreclosure_pc_2020 )
+  
+    # Compute mean square error
+    mse <- mean((predict(model) - pg_foreclosures_train$foreclosure_pc_2020 )^2)
+  
+    # Print results
+    cat("Repetition:", i, "\n")
+    cat("Variable:", variable, "\n")
+    cat("Intercept:", intercept, "\n")
+    cat("Coefficient:", coefficient, "\n")
+    cat("Is it a predictive feature?:", is_predictive, "\n")
+    cat("Correlation:", correlation, "\n")
+    cat("Mean Square Error:", mse, "\n")
+    cat("\n")
+  }
+}
+
+
+```
+It appears that the correlation coefficient and mean squared error of each model can vary substantially depending on the training and test set.
+
+We can also test our most successful multivariate regression model with multiple training and test sets.
+
+```{r}
+
+# Set the number of iterations
+num_iterations <- 5
+
+# Initialize empty vectors to store results
+correlations <- numeric(num_iterations)
+mses <- numeric(num_iterations)
+
+for (i in 1:num_iterations) {
+  # Convert tract_number to character before splitting the data
+  pg_foreclosures_per_tract$tract_number <- as.character(pg_foreclosures_per_tract$tract_number)
+
+  # Split the data into training and testing sets
+  set.seed(i) # Use different seed for each iteration
+  train_indices <- createDataPartition(pg_foreclosures_per_tract$foreclosure_pc_2020, p = 0.8, list = FALSE)
+  train_data <- pg_foreclosures_per_tract[train_indices, ]
+  test_data <- pg_foreclosures_per_tract[-train_indices, ]
+
+  # Train the linear regression model on the training data
+  lm_model <- lm(foreclosure_pc_2020 ~ ., data = train_data[, c("foreclosure_pc_2020", test_variables_3)])
+
+  # Use the trained model to predict on the testing data
+  predicted_values <- predict(lm_model, newdata = test_data[, test_variables_3])
+
+  # Calculate the correlation between the predicted and real values
+  correlation <- cor(predicted_values, test_data$foreclosure_pc_2020)
+
+  # Calculate the mean squared error between the predicted and real values
+  mse <- mean((predicted_values - test_data$foreclosure_pc_2020)^2)
+
+  # Store correlation and mse
+  correlations[i] <- correlation
+  mses[i] <- mse
+}
+
+# Print the results of each iteration
+for (i in 1:num_iterations) {
+  cat("Iteration", i, "\n")
+  cat("Correlation between predicted and real values:", correlations[i], "\n")
+  cat("Mean Squared Error:", mses[i], "\n\n")
+}
+
+```
+Next, we can repeat the process of building regularized univariate regression models with multiple randomly sampled training and test sets.
+
+```{r}
+# Set the regularization parameter
+lambda <- 0.2
+
+# Number of iterations
+num_iterations <- 5
+
+for (iteration in 1:num_iterations) {
+    # Split data into training and test sets
+    set.seed(iteration)  # Set seed for reproducibility
+    sample_indices <- sample(1:nrow(pg_foreclosures_per_tract), size = 0.7 * nrow(pg_foreclosures_per_tract), replace = FALSE)
+    pg_foreclosures_train <- pg_foreclosures_per_tract[sample_indices, ]
+    pg_foreclosures_test <- pg_foreclosures_per_tract[-sample_indices, ]
+    
+    for (variable in variables_of_interest) {
+        # Prepare the data
+        X_train <- model.matrix(foreclosure_pc_2020 ~ ., data = pg_foreclosures_train[, c(variables_of_interest, "foreclosure_pc_2020")])[, -1]
+        y_train <- pg_foreclosures_train$foreclosure_pc_2020
+        X_test <- model.matrix(foreclosure_pc_2020 ~ ., data = pg_foreclosures_test[, c(variables_of_interest, "foreclosure_pc_2020")])[, -1]
+        y_test <- pg_foreclosures_test$foreclosure_pc_2020
+        
+        # Fit the Lasso regression model
+        lasso_model <- glmnet(X_train, y_train, alpha = 1, lambda = lambda)
+        
+        # Extract coefficients
+        coef_idx <- which(colnames(X_train) == variable)
+        coefficient <- coef(lasso_model)[coef_idx]
+        
+        # Check if the coefficient is non-zero
+        is_predictive <- ifelse(abs(coefficient) > 0, "Yes", "No")
+        
+        # Compute residuals
+        residuals <- y_test - predict(lasso_model, newx = X_test)
+        
+        # Compute correlation between predicted and real values
+        correlation <- cor(predict(lasso_model, newx = X_test), y_test)
+        
+        # Compute mean square error
+        mse <- mean(residuals^2)
+        
+        # Print results
+        cat("Iteration:", iteration, "\n")
+        cat("Variable:", variable, "\n")
+        cat("Coefficient:", coefficient, "\n")
+        cat("Is it a predictive feature?:", is_predictive, "\n")
+        cat("Correlation:", correlation, "\n")
+        cat("Mean Square Error:", mse, "\n")
+        cat("\n")
+    }
+}
+
+
+```
+
+
+
+We can also repeat our regularized multivariate regression model with multiple randomly sampled training and test sets.
+
+```{r}
+
+# Set the number of iterations
+num_iterations <- 5
+
+# Initialize empty vectors to store results
+correlations <- numeric(num_iterations)
+mses <- numeric(num_iterations)
+
+for (i in 1:num_iterations) {
+  # Convert tract_number to character before splitting the data
+  pg_foreclosures_per_tract$tract_number <- as.character(pg_foreclosures_per_tract$tract_number)
+
+  # Split the data into training and testing sets
+  set.seed(i) # Use different seed for each iteration
+  train_indices <- createDataPartition(pg_foreclosures_per_tract$foreclosure_pc_2020, p = 0.8, list = FALSE)
+  train_data <- pg_foreclosures_per_tract[train_indices, ]
+  test_data <- pg_foreclosures_per_tract[-train_indices, ]
+
+  # Train the linear regression model on the training data
+  lm_model <- lm(foreclosure_pc_2020 ~ ., data = train_data[, c("foreclosure_pc_2020", test_variables_3)])
+
+  # Use the trained model to predict on the testing data
+  predicted_values <- predict(lm_model, newdata = test_data[, test_variables_3])
+
+  # Calculate the correlation between the predicted and real values
+  correlation <- cor(predicted_values, test_data$foreclosure_pc_2020)
+
+  # Calculate the mean squared error between the predicted and real values
+  mse <- mean((predicted_values - test_data$foreclosure_pc_2020)^2)
+
+  # Store correlation and mse
+  correlations[i] <- correlation
+  mses[i] <- mse
+}
+
+# Print the results of each iteration
+for (i in 1:num_iterations) {
+  cat("Iteration", i, "\n")
+  cat("Correlation between predicted and real values:", correlations[i], "\n")
+  cat("Mean Squared Error:", mses[i], "\n\n")
+}
+
+```
+The correlations between predicted results and actual results can vary relatively significantly between test sets, which is concerning. The variation is likely the result of our small sample size. 

@@ -1,0 +1,284 @@
+---
+title: "pg_foreclosure_svm"
+author: "Paul Kiefer"
+date: "2024-04-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+options(scipen=999)
+##install.packages("ggrepel")
+##install.packages('ggthemes')
+##install.packages('gplots')
+#install.packages('car')
+##install.packages("glmnet")
+##install.packages("neuralnet")
+install.packages("keras")
+library(tidyverse)
+library(dplyr)
+#Necessary for date parsing.
+library(lubridate)
+#Necessary for column name cleaning.
+library(janitor)
+#Eventually necessary for visualization
+library(ggthemes)
+#Necessary for Census API calls.
+library(tidycensus)
+#Eventually necessary for visualizations.
+library(ggplot2)
+library(gplots)
+#Potentially necessary for cleaning.
+library(ggrepel)
+#Eventually necessary for visualizations.
+library(tigris)
+#Simple features.
+library(sf)
+#Eventually necessary for mapping.
+library(ggmap)
+#Needed for dividing into training and test sets.
+library(caret)
+#Needed for data pre-processing and evaluation
+library(car)
+#Needed for regularization
+library(glmnet)
+library(e1071) 
+#Needed to build SVM model
+library(neuralnet)
+#Needed for neural networks
+library(nnet)
+#Needed to plot neural networks
+```
+
+Read in our dataset: 
+
+```{r}
+pg_foreclosures_per_tract <- read_csv("datasets/pg_foreclosures_per_tract.csv", guess_max=173)
+```
+First, we build an SVM using the continuous variable foreclosure_pc_2020.
+
+```{r}
+# Step 1: Data Preprocessing
+# Set seed for reproducibility
+set.seed(123)
+
+# Randomly sample row indices for the training set
+train_index <- sample(nrow(pg_foreclosures_per_tract), 0.8 * nrow(pg_foreclosures_per_tract))
+
+# Create training and testing datasets
+train_data <- pg_foreclosures_per_tract[train_index, ]
+test_data <- pg_foreclosures_per_tract[-train_index, ]
+
+# Step 2: Model Training
+svm_model <- svm(foreclosure_pc_2020 ~ ., data = train_data, kernel = "linear")
+
+# Step 3: Model Evaluation
+# Predictions on test set
+predictions <- predict(svm_model, test_data)
+
+# Calculate evaluation metrics
+mse <- mean((test_data$foreclosure_pc_2020 - predictions)^2)
+rmse <- sqrt(mse)
+rsquared <- cor(predictions, test_data$foreclosure_pc_2020)^2
+
+# Print evaluation metrics
+print(paste("Mean Squared Error (MSE):", mse))
+print(paste("Root Mean Squared Error (RMSE):", rmse))
+print(paste("R-squared (R²):", rsquared))
+```
+
+Next, we create a column called foreclosure_hi_med_low to the dataframe and test a version of the SVM that uses a classifier rather than a regression. 
+
+```{r}
+# Add a new column 'foreclosure_hi_med_low' to the dataframe
+pg_foreclosures_per_tract$foreclosure_hi_med_low <- cut(pg_foreclosures_per_tract$foreclosure_pc_2020,
+                                                        breaks = quantile(pg_foreclosures_per_tract$foreclosure_pc_2020, probs = c(0, 1/3, 2/3, 1)),
+                                                        labels = c(1, 2, 3),
+                                                        include.lowest = TRUE)
+
+# Convert the new column to factor
+pg_foreclosures_per_tract$foreclosure_hi_med_low <- as.factor(pg_foreclosures_per_tract$foreclosure_hi_med_low)
+
+# Train-test split
+set.seed(123)
+train_index <- createDataPartition(pg_foreclosures_per_tract$foreclosure_hi_med_low, p = 0.8, list = FALSE)
+train_data <- pg_foreclosures_per_tract[train_index, ]
+test_data <- pg_foreclosures_per_tract[-train_index, ]
+
+# Train SVM model for classification
+svm_model_classification <- svm(foreclosure_hi_med_low ~ ., data = train_data, kernel = "linear")
+
+# Predictions on test set
+predictions_classification <- predict(svm_model_classification, test_data)
+
+# Evaluate classification performance
+confusionMatrix(predictions_classification, test_data$foreclosure_hi_med_low)
+```
+
+SVM Classification with RBF Kernel
+```{r}
+# Train SVM model with RBF kernel for classification
+svm_model_rbf <- svm(foreclosure_hi_med_low ~ ., data = train_data, kernel = "radial")
+
+# Predictions on test set
+predictions_rbf <- predict(svm_model_rbf, test_data)
+
+# Evaluate classification performance
+confusionMatrix(predictions_rbf, test_data$foreclosure_hi_med_low)
+```
+SVM Model with Polynomial Kernel for Regression
+
+```{r}
+# Train SVM model with Polynomial kernel for regression
+svm_model_poly <- svm(foreclosure_pc_2020 ~ ., data = train_data, kernel = "polynomial")
+
+# Predictions on test set
+predictions_poly <- predict(svm_model_poly, test_data)
+
+# Calculate evaluation metrics (RMSE for regression)
+rmse_poly <- sqrt(mean((test_data$foreclosure_pc_2020 - predictions_poly)^2))
+print(paste("Root Mean Squared Error (RMSE) for Polynomial Kernel:", rmse_poly))
+```
+We can check the significance of that RMSE:
+```{r}
+# Calculate the range of foreclosures_pc_2020 values
+min_value <- min(pg_foreclosures_per_tract$foreclosure_pc_2020)
+max_value <- max(pg_foreclosures_per_tract$foreclosure_pc_2020)
+range_values <- max_value - min_value
+
+# Print the range
+print(paste("Range of foreclosures_pc_2020 values:", range_values))
+
+# Compare RMSE to the range of values
+print(paste("Root Mean Squared Error (RMSE):", rmse_poly))
+if (rmse_poly < range_values) {
+  print("RMSE is relatively small compared to the range of foreclosures_pc_2020 values.")
+} else {
+  print("RMSE is relatively large compared to the range of foreclosures_pc_2020 values.")
+}
+
+# Additional assessment
+# You can also consider comparing RMSE to the standard deviation of the target variable
+standard_deviation <- sd(pg_foreclosures_per_tract$foreclosure_pc_2020)
+print(paste("Standard Deviation of foreclosures_pc_2020 values:", standard_deviation))
+if (rmse_poly < standard_deviation) {
+  print("RMSE is relatively small compared to the standard deviation of foreclosures_pc_2020 values.")
+} else {
+  print("RMSE is relatively large compared to the standard deviation of foreclosures_pc_2020 values.")
+}
+```
+Neural Networks:
+
+
+Test Neural Networks:
+  
+```{r}
+# Select the list of independent variables and the dependent variable
+independent_variables <- c(
+  "avg_bed", "tract_homevalue_2020", "tract_medage_2020", "tract_medincome_2020", 
+  "tract_medincome_2010", "foreclosure_pc_2010", "pct_built_2020_later", 
+  "pct_built_2010_2019", "pct_built_2000_2009", "pct_built_1990_1999", 
+  "pct_built_1980_1989", "pct_built_1970_1979", "pct_built_pre_1960", 
+  "pct_0_bd", "pct_1_bd", "pct_2_bd", "pct_3_bd", "pct_4_more_bd", 
+  "poverty_2010", "poverty_2020", "nhwhite_2010", "nhwhite_2020", 
+  "mortgaged_2010", "mortgaged_2015", "mortgaged_2020", "ownoccupied_2010", 
+  "ownoccupied_2015", "ownoccupied_2020", "mortgage_change_2010_2015", 
+  "mortgage_change_2015_2020", "mortgage_change_2010_2020", 
+  "ownoccupied_change_2010_2015", "ownoccupied_change_2015_2020", 
+  "ownoccupied_change_2010_2020", "poverty_change_2010_2020", 
+  "nhwhite_change_2010_2020", "medincome_change_2010_2015", 
+  "medincome_change_2015_2020", "medincome_change_2010_2020", "pop_change_pct"
+)
+
+# Extract the selected columns from the dataframe
+selected_data <- pg_foreclosures_per_tract[independent_variables]
+
+# Normalize the selected columns
+selected_data_normalized <- selected_data
+selected_data_normalized[] <- lapply(selected_data, min_max_scaling)
+
+# Add foreclosure_pc_2020 to the normalized dataframe
+selected_data_normalized$foreclosure_pc_2020 <- min_max_scaling(pg_foreclosures_per_tract$foreclosure_pc_2020)
+
+# Split data into training and testing sets
+set.seed(123)
+train_index <- createDataPartition(selected_data_normalized$foreclosure_pc_2020, p = 0.8, list = FALSE)
+train_data <- selected_data_normalized[train_index, ]
+test_data <- selected_data_normalized[-train_index, ]
+
+# Define configurations to test
+configurations <- list(
+  list(hidden_layers = 1, neurons_per_layer = c(10), activation_function = "logistic"),
+  list(hidden_layers = 2, neurons_per_layer = c(10, 5), activation_function = "tanh")
+  # Add more configurations as needed
+)
+
+# Function to build and train neural network model
+train_nn_model <- function(hidden_layers, neurons_per_layer, activation_function, train_data, test_data) {
+  # Build neural network model
+  model <- neuralnet(
+    foreclosure_pc_2020 ~ .,
+    data = train_data,  # Use normalized training data
+    hidden = neurons_per_layer,
+    linear.output = TRUE,  # For regression tasks
+    act.fct = activation_function
+  )
+  
+  # Make predictions on test data
+  predictions <- predict(model, test_data)
+  
+  # Calculate evaluation metrics (e.g., RMSE)
+  rmse <- sqrt(mean((test_data$foreclosure_pc_2020 - predictions)^2))
+  
+  # Return performance results
+  return(list(
+    rmse = rmse,
+    activation_function = activation_function,
+    hidden_layers = hidden_layers,
+    neurons_per_layer = neurons_per_layer
+  ))
+}
+
+# Evaluate neural network models for each configuration
+results <- lapply(configurations, function(config) {
+  train_nn_model(config$hidden_layers, config$neurons_per_layer, config$activation_function, train_data, test_data)
+})
+
+
+# Report results
+for (i in seq_along(results)) {
+  cat("Configuration:", i, "\n")
+  cat("RMSE:", results[[i]]$rmse, "\n")
+  cat("Activation Function:", results[[i]]$activation_function, "\n")
+  cat("Hidden Layers:", results[[i]]$hidden_layers, "\n")
+  cat("Neurons per Layer:", results[[i]]$neurons_per_layer, "\n\n")
+}
+
+# Identify the best configuration based on performance metrics
+best_config <- configurations[[which.min(sapply(results, function(x) x$rmse))]]
+
+# Train the best model with the identified configuration
+best_model <- train_nn_model(best_config$hidden_layers, best_config$neurons_per_layer, best_config$activation_function, train_data = train_data, test_data = test_data)
+```
+
+```{r}
+# Report results
+for (i in seq_along(results)) {
+  cat("Configuration:", i, "\n")
+  cat("RMSE:", results[[i]]$rmse, "\n")
+  cat("Activation Function:", results[[i]]$activation_function, "\n")
+  cat("Hidden Layers:", results[[i]]$hidden_layers, "\n")
+  cat("Neurons per Layer:", results[[i]]$neurons_per_layer, "\n\n")
+}
+
+# Identify the best configuration based on performance metrics
+best_config <- configurations[[which.min(sapply(results, function(x) x$rmse))]]
+
+# Train the best model with the identified configuration
+best_model <- train_nn_model(best_config$hidden_layers, best_config$neurons_per_layer, best_config$activation_function, train_data = train_data, test_data = test_data)
+```
+
+
