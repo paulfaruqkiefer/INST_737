@@ -193,6 +193,10 @@ independent_variables <- c(
   "medincome_change_2015_2020", "medincome_change_2010_2020", "pop_change_pct"
 )
 
+min_max_scaling <- function(x) {
+  (x - min(x)) / (max(x) - min(x))
+}
+
 # Extract the selected columns from the dataframe
 selected_data <- pg_foreclosures_per_tract[independent_variables]
 
