@@ -331,18 +331,40 @@ best_config <- configurations[[which.min(sapply(results, function(x) x$rmse))]]
 
 # Train the best model with the identified configuration
 best_model <- train_nn_model(best_config$hidden_layers, best_config$neurons_per_layer, best_config$activation_function, train_data, test_data)
+```
 
-# Plot the neural network model
-plot(best_model$model)
+```{r}
+install.packages("igraph")
+library(igraph)
+```
+
+```{r}
+# Define the formula for the neural network
+formula <- as.formula(paste("foreclosure_pc_2020 ~", paste(independent_variables, collapse = " + ")))
+
+# Define and train the neural network model
+model <- neuralnet(
+  formula = formula,
+  data = train_data,  # Assuming train_data is your training dataset
+  hidden = c(10, 5),  # Number of neurons in each hidden layer
+  linear.output = FALSE,  # Use nonlinear activation functions
+  act.fct = "logistic"   # Activation function for hidden layers
+)
+
+# Visualize the network architecture
+network <- model$weights[[1]]  # Extract network weights
+graph <- graph_from_data_frame(network, directed = TRUE)  # Create a directed graph
+plot(graph, edge.arrow.size = 0.5, vertex.size = 30, vertex.label.cex = 1.5)  # Plot the graph
+
 ```
 
 
+Feature selection:
 
 
 ```{r}
 # Filter Method for SVM
 library(caret)
-
 
 # Ensure 'foreclosure_pc_2020' is included in train_data
 train_data <- cbind(train_data, foreclosure_pc_2020 = pg_foreclosures_per_tract[train_index, "foreclosure_pc_2020"])
