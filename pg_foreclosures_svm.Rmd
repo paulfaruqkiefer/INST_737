@@ -170,6 +170,46 @@ if (rmse_poly < standard_deviation) {
   print("RMSE is relatively large compared to the standard deviation of foreclosures_pc_2020 values.")
 }
 ```
+```{r}
+# Train SVM model with RBF kernel for regression
+svm_model_rbf_regression <- svm(foreclosure_pc_2020 ~ ., data = train_data, kernel = "radial")
+
+# Predictions on test set
+predictions_rbf_regression <- predict(svm_model_rbf_regression, test_data)
+
+# Calculate evaluation metrics (RMSE for regression)
+rmse_rbf_regression <- sqrt(mean((test_data$foreclosure_pc_2020 - predictions_rbf_regression)^2))
+print(paste("Root Mean Squared Error (RMSE) for RBF Kernel (Regression):", rmse_rbf_regression))
+```
+
+SVM classification model with Polynomial kernel;
+```{r}
+# Train-test split
+set.seed(123)
+train_index <- createDataPartition(pg_foreclosures_per_tract$foreclosure_pc_2020, p = 0.8, list = FALSE)
+train_data <- pg_foreclosures_per_tract[train_index, ]
+test_data <- pg_foreclosures_per_tract[-train_index, ]
+
+# Add a new column 'foreclosure_hi_med_low' to the dataframe
+train_data$foreclosure_hi_med_low <- cut(train_data$foreclosure_pc_2020,
+                                         breaks = quantile(train_data$foreclosure_pc_2020, probs = c(0, 1/3, 2/3, 1)),
+                                         labels = c(1, 2, 3),
+                                         include.lowest = TRUE)
+
+# Convert the new column to factor
+train_data$foreclosure_hi_med_low <- as.factor(train_data$foreclosure_hi_med_low)
+
+# Train SVM model with Polynomial kernel for classification
+svm_model_poly_classification <- svm(foreclosure_hi_med_low ~ ., data = train_data, kernel = "polynomial")
+
+# Predictions on test set
+predictions_poly_classification <- predict(svm_model_poly_classification, test_data)
+
+# Evaluate classification performance
+confusionMatrix(predictions_poly_classification, test_data$foreclosure_hi_med_low)
+```
+
+
 Neural Networks:
 
 
@@ -216,9 +256,17 @@ test_data <- selected_data_normalized[-train_index, ]
 # Define configurations to test
 configurations <- list(
   list(hidden_layers = 1, neurons_per_layer = c(10), activation_function = "logistic"),
-  list(hidden_layers = 2, neurons_per_layer = c(10, 5), activation_function = "tanh")
-  # Add more configurations as needed
+  list(hidden_layers = 2, neurons_per_layer = c(10, 5), activation_function = "tanh"),
+  list(hidden_layers = 1, neurons_per_layer = c(5), activation_function = "logistic"),
+  list(hidden_layers = 2, neurons_per_layer = c(5, 3), activation_function = "tanh"),
+  list(hidden_layers = 3, neurons_per_layer = c(8, 6, 4), activation_function = "logistic"),
+  list(hidden_layers = 3, neurons_per_layer = c(12, 8, 4), activation_function = "tanh"),
+  list(hidden_layers = 4, neurons_per_layer = c(10, 8, 6, 4), activation_function = "logistic"),
+  list(hidden_layers = 4, neurons_per_layer = c(12, 10, 6, 3), activation_function = "tanh"),
+  list(hidden_layers = 5, neurons_per_layer = c(15, 12, 10, 8, 6), activation_function = "logistic"),
+  list(hidden_layers = 5, neurons_per_layer = c(20, 15, 12, 8, 5), activation_function = "tanh")
 )
+
 
 # Function to build and train neural network model
 train_nn_model <- function(hidden_layers, neurons_per_layer, activation_function, train_data, test_data) {
@@ -282,7 +330,89 @@ for (i in seq_along(results)) {
 best_config <- configurations[[which.min(sapply(results, function(x) x$rmse))]]
 
 # Train the best model with the identified configuration
-best_model <- train_nn_model(best_config$hidden_layers, best_config$neurons_per_layer, best_config$activation_function, train_data = train_data, test_data = test_data)
+best_model <- train_nn_model(best_config$hidden_layers, best_config$neurons_per_layer, best_config$activation_function, train_data, test_data)
+
+# Plot the neural network model
+plot(best_model$model)
 ```
 
+
+
+
+```{r}
+# Filter Method for SVM
+library(caret)
+
+
+# Ensure 'foreclosure_pc_2020' is included in train_data
+train_data <- cbind(train_data, foreclosure_pc_2020 = pg_foreclosures_per_tract[train_index, "foreclosure_pc_2020"])
+
+# Perform correlation-based feature selection
+selected_features <- findCorrelation(cor(train_data[, -which(names(train_data) == "foreclosure_pc_2020")]), cutoff = 0.8)
+
+# Train SVM model with selected features
+svm_model_filtered <- svm(foreclosure_pc_2020 ~ ., data = train_data[, selected_features], kernel = "linear")
+
+# Evaluate the filtered SVM model
+predictions_filtered <- predict(svm_model_filtered, test_data[, selected_features])
+mse_filtered <- mean((test_data$foreclosure_pc_2020 - predictions_filtered)^2)
+rmse_filtered <- sqrt(mse_filtered)
+rsquared_filtered <- cor(predictions_filtered, test_data$foreclosure_pc_2020)^2
+
+# Print evaluation metrics for filtered SVM model
+print("Evaluation Metrics for Filtered SVM Model:")
+print(paste("Mean Squared Error (MSE):", mse_filtered))
+print(paste("Root Mean Squared Error (RMSE):", rmse_filtered))
+print(paste("R-squared (R²):", rsquared_filtered))
+```
+
+
+
+```{r}
+# Wrapper Method for Naive Bayes
+library(caret)
+
+# Perform recursive feature elimination
+control <- rfeControl(functions = nbFuncs, method = "cv", number = 10)
+naive_bayes_rfe <- rfe(train_data_2[, -which(names(train_data_2) == "foreclosure_quantile")], 
+                        train_data_2$foreclosure_quantile, 
+                        sizes = c(1:10), 
+                        rfeControl = control)
+
+# Print the results of recursive feature elimination
+print(naive_bayes_rfe)
+```
+
+
+
+```{r}
+# Embedded Method for Linear Regression
+library(glmnet)
+
+# Fit LASSO model
+lasso_model <- cv.glmnet(as.matrix(train_data_multivariate_1[, test_variables_3]), 
+                         train_data_multivariate_1$foreclosure_pc_2020, 
+                         alpha = 1)
+
+# Extract selected features from LASSO model
+selected_features_lasso <- coef(lasso_model, s = "lambda.min")[-1, ]
+selected_features_lasso <- names(selected_features_lasso[selected_features_lasso != 0])
+
+# Train linear regression model with selected features
+lm_model_filtered <- lm(foreclosure_pc_2020 ~ ., 
+                        data = train_data_multivariate_1[, c("foreclosure_pc_2020", selected_features_lasso)])
+
+# Evaluate the filtered linear regression model
+predictions_filtered_lm <- predict(lm_model_filtered, test_data_multivariate_1[, c("foreclosure_pc_2020", selected_features_lasso)])
+mse_filtered_lm <- mean((test_data_multivariate_1$foreclosure_pc_2020 - predictions_filtered_lm)^2)
+rmse_filtered_lm <- sqrt(mse_filtered_lm)
+rsquared_filtered_lm <- cor(predictions_filtered_lm, test_data_multivariate_1$foreclosure_pc_2020)^2
+
+# Print evaluation metrics for filtered linear regression model
+print("Evaluation Metrics for Filtered Linear Regression Model:")
+print(paste("Mean Squared Error (MSE):", mse_filtered_lm))
+print(paste("Root Mean Squared Error (RMSE):", rmse_filtered_lm))
+print(paste("R-squared (R²):", rsquared_filtered_lm))
+
+```
 
