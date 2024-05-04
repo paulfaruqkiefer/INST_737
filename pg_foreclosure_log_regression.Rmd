@@ -76,6 +76,11 @@ pg_foreclosures_per_tract_log_reg <- pg_foreclosures_per_tract %>%
          ))
 ```
 
+```{r}
+write_csv(pg_foreclosures_per_tract_log_reg, "datasets/pg_foreclosures_per_tract_log_reg.csv")
+```
+
+
 To create an initial model, we start by dividing our data into training and test sets. We use 70% of the rows for the training set and 30% for the test set.
 
 ```{r}
@@ -269,9 +274,6 @@ We can now test that model on our test set.
 We can first calculate the correlation between the quantile values predicted by our model and the actual quantile values of our data.
 
 ```{r}
-# Open a jpeg device to save the plot
-jpeg("correlation_plot_log_reg_model_1.jpg")
-
 # Predict values using the model and test data
 predicted_values <- predict(model_1, newdata = test_data, type = "class")
 
@@ -332,9 +334,6 @@ It appears that this model only correctly predicts the foreclosure per capita qu
 With that result in mind, we can also test our fifth model.
 
 ```{r}
-# Open a jpeg device to save the plot
-jpeg("correlation_plot_log_reg_model_6.jpg")
-
 # Predict values using the model and test data
 predicted_values <- predict(model_6, newdata = test_data, type = "class")
 
