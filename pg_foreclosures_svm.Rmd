@@ -66,7 +66,7 @@ pg_foreclosures_per_tract_log_reg <- read_csv("datasets/pg_foreclosures_per_trac
 ```
 
 
-First, we build an SVM using the continuous variable foreclosure_pc_2020.
+First, we build an SVM using a regression approach and the continuous variable foreclosure_pc_2020.
 
 ```{r}
 # Step 1: Data Preprocessing
@@ -99,7 +99,7 @@ train_data_1 <- selected_data[train_index, ]
 test_data_1 <- selected_data[-train_index, ]
 
 # Step 2: Model Training
-svm_model <- svm(as.formula(paste(dependent_variable, "~ .")), data = train_data_1, kernel = "linear")
+svm_model <- svm(as.formula(paste(dependent_variable, "~ .")), data = train_data_1, kernel ="linear")
 
 # Step 3: Model Evaluation
 predictions <- predict(svm_model, test_data_1)
@@ -115,6 +115,34 @@ print(paste("Root Mean Squared Error (RMSE):", rmse))
 print(paste("R-squared (R²):", rsquared))
 
 ```
+
+To test the significance of that RSME, we can compare it to the standard deviation of the dependent variable.
+
+```{r}
+# Calculate the residuals
+residuals <- test_data_1[[dependent_variable]] - predictions
+
+# Calculate RMSE
+RMSE <- sqrt(mean(residuals^2))
+
+# Check if the RMSE is significantly different from the standard deviation
+# Using a t-test
+t_test_result <- t.test(test_data_1[[dependent_variable]], predictions)
+
+# Check the p-value from the t-test
+p_value <- t_test_result$p.value
+
+# Check if p-value is less than a significance level (e.g., 0.05)
+significance_level <- 0.05
+if (p_value < significance_level) {
+  print("RMSE is statistically significant.")
+} else {
+  print("RMSE is not statistically significant.")
+}
+
+print(p_value)
+```
+In other words, the RSME of the first SVM is not so substantial that the difference between the predicted and actual values has a reasonable chance of occurring due to random chance alone. 
 
 Next, we create a column called foreclosure_hi_med_low to the dataframe and test a version of the SVM that uses a classifier rather than a regression. 
 
@@ -162,63 +190,30 @@ svm_model_classification <- svm(foreclosure_hi_med_low ~ ., data = selected_trai
 predictions_classification <- predict(svm_model_classification, selected_test_data_2)
 
 # Evaluate classification performance
-confusionMatrix(predictions_classification, selected_test_data_2$foreclosure_hi_med_low)
+conf_matrix <- confusionMatrix(predictions_classification, selected_test_data_2$foreclosure_hi_med_low)
+
+# Calculate precision, recall, specificity, and F1 measure for each class
+precision <- diag(conf_matrix$table) / colSums(conf_matrix$table)
+recall <- diag(conf_matrix$table) / rowSums(conf_matrix$table)
+specificity <- diag(conf_matrix$table[2:3, 2:3]) / colSums(conf_matrix$table[2:3, 2:3])
+f1_measure <- 2 * (precision * recall) / (precision + recall)
+
+# Print the confusion matrix
+print(conf_matrix)
+
+# Print precision, recall, specificity, and F1 measure for each class
+cat("\nPrecision:\n", precision, "\n")
+cat("Recall:\n", recall, "\n")
+cat("Specificity:\n", specificity, "\n")
+cat("F1 Measure:\n", f1_measure, "\n")
+
 
 ```
+**NON-LINEAR KERNELS**
 
-SVM Classification with RBF Kernel
-```{r}
-# Train SVM model with RBF kernel for classification
-svm_model_rbf <- svm(foreclosure_hi_med_low ~ ., data = train_data_2, kernel = "radial")
+We will test both the regression and classification models with RBF and polynomial kernels.
 
-# Predictions on test set
-predictions_rbf <- predict(svm_model_rbf, test_data_2)
-
-# Evaluate classification performance
-confusionMatrix(predictions_rbf, test_data_2$foreclosure_hi_med_low)
-```
-SVM Model with Polynomial Kernel for Regression
-
-```{r}
-# Train SVM model with Polynomial kernel for regression
-svm_model_poly <- svm(foreclosure_pc_2020 ~ ., data = train_data_1, kernel = "polynomial")
-
-# Predictions on test set
-predictions_poly <- predict(svm_model_poly, test_data_1)
-
-# Calculate evaluation metrics (RMSE for regression)
-rmse_poly <- sqrt(mean((test_data_1$foreclosure_pc_2020 - predictions_poly)^2))
-print(paste("Root Mean Squared Error (RMSE) for Polynomial Kernel:", rmse_poly))
-```
-We can check the significance of that RMSE:
-```{r}
-# Calculate the range of foreclosures_pc_2020 values
-min_value <- min(pg_foreclosures_per_tract$foreclosure_pc_2020)
-max_value <- max(pg_foreclosures_per_tract$foreclosure_pc_2020)
-range_values <- max_value - min_value
-
-# Print the range
-print(paste("Range of foreclosures_pc_2020 values:", range_values))
-
-# Compare RMSE to the range of values
-print(paste("Root Mean Squared Error (RMSE):", rmse_poly))
-if (rmse_poly < range_values) {
-  print("RMSE is relatively small compared to the range of foreclosures_pc_2020 values.")
-} else {
-  print("RMSE is relatively large compared to the range of foreclosures_pc_2020 values.")
-}
-
-# Additional assessment
-# You can also consider comparing RMSE to the standard deviation of the target variable
-standard_deviation <- sd(pg_foreclosures_per_tract$foreclosure_pc_2020)
-print(paste("Standard Deviation of foreclosures_pc_2020 values:", standard_deviation))
-if (rmse_poly < standard_deviation) {
-  print("RMSE is relatively small compared to the standard deviation of foreclosures_pc_2020 values.")
-} else {
-  print("RMSE is relatively large compared to the standard deviation of foreclosures_pc_2020 values.")
-}
-```
-
+First, the regression SVM with an RBF kernel:
 
 ```{r}
 # Train SVM model with RBF kernel for regression
@@ -232,31 +227,155 @@ rmse_rbf_regression <- sqrt(mean((test_data_1$foreclosure_pc_2020 - predictions_
 print(paste("Root Mean Squared Error (RMSE) for RBF Kernel (Regression):", rmse_rbf_regression))
 ```
 
-SVM classification model with Polynomial kernel;
+This RMSE is slightly larger than the RSME of the model with a linear kernel. 
+
+To test the significance of that RMSE, we compare it to the standard deviation of foreclosure_pc_2020. 
+
+```{r}
+# Predictions on test set
+predictions_rbf_regression <- predict(svm_model_rbf_regression, test_data_1)
+
+# Calculate the residuals
+residuals_rbf_regression <- test_data_1$foreclosure_pc_2020 - predictions_rbf_regression
+
+# Calculate RMSE
+rmse_rbf_regression <- sqrt(mean(residuals_rbf_regression^2))
+print(paste("Root Mean Squared Error (RMSE) for RBF Kernel (Regression):", rmse_rbf_regression))
+
+# Check if the RMSE is significantly different from the standard deviation
+# Using a t-test
+t_test_result <- t.test(test_data_1$foreclosure_pc_2020, predictions_rbf_regression)
+
+# Check the p-value from the t-test
+p_value <- t_test_result$p.value
+
+# Check if p-value is less than a significance level (e.g., 0.05)
+significance_level <- 0.05
+if (p_value < significance_level) {
+  print("RMSE is statistically significant.")
+} else {
+  print("RMSE is not statistically significant.")
+}
+
+print(p_value)
+```
+
+While the comparison does not provide evidence to disprove the null hypothesis, it is still not a stronger model than the model with a linear kernel.
+
+Next, the regression SVM Model with a polynomial kernel. 
+
+```{r}
+# Train SVM model with Polynomial kernel for regression
+svm_model_poly <- svm(foreclosure_pc_2020 ~ ., data = train_data_1, kernel = "polynomial")
+
+# Predictions on test set
+predictions_poly <- predict(svm_model_poly, test_data_1)
+
+# Calculate evaluation metrics (RMSE for regression)
+rmse_poly <- sqrt(mean((test_data_1$foreclosure_pc_2020 - predictions_poly)^2))
+print(paste("Root Mean Squared Error (RMSE) for Polynomial Kernel:", rmse_poly))
+```
+
+This RMSE is also slightly higher than the RMSE of the model with a linear kernel. 
+
+We can check the significance of that RMSE by comparing it to the standard deviation and range of foreclosure_pc_2020. 
+```{r}
+# Train SVM model with Polynomial kernel for regression
+svm_model_poly <- svm(foreclosure_pc_2020 ~ ., data = train_data_1, kernel = "polynomial")
+
+# Predictions on test set
+predictions_poly <- predict(svm_model_poly, test_data_1)
+
+# Calculate evaluation metrics (RMSE for regression)
+rmse_poly <- sqrt(mean((test_data_1$foreclosure_pc_2020 - predictions_poly)^2))
+print(paste("Root Mean Squared Error (RMSE) for Polynomial Kernel:", rmse_poly))
+
+# Check if the RMSE is significantly different from the standard deviation
+# Using a t-test
+t_test_result <- t.test(test_data_1$foreclosure_pc_2020, predictions_poly)
+
+# Check the p-value from the t-test
+p_value <- t_test_result$p.value
+
+# Check if p-value is less than a significance level (e.g., 0.05)
+significance_level <- 0.05
+if (p_value < significance_level) {
+  print("RMSE is statistically significant.")
+} else {
+  print("RMSE is not statistically significant.")
+}
+
+print(p_value)
+```
+While the comparison does not provide evidence to disprove the null hypothesis, it is still not a stronger model than both the model with a linear kernel and the model with the RBF kernel.
+
+Next, we apply both the RBF and polynomial kernels to the classification SVM.
+
+SVM Classification with RBF Kernel
 ```{r}
 # Train-test split
 set.seed(123)
-train_index <- createDataPartition(pg_foreclosures_per_tract$foreclosure_pc_2020, p = 0.8, list = FALSE)
-train_data_3 <- pg_foreclosures_per_tract[train_index, ]
-test_data_3 <- pg_foreclosures_per_tract[-train_index, ]
+train_index <- createDataPartition(pg_foreclosures_per_tract$foreclosure_hi_med_low, p = 0.8, list = FALSE)
+train_data_2 <- pg_foreclosures_per_tract[train_index, ]
+test_data_2 <- pg_foreclosures_per_tract[-train_index, ]
 
-# Add a new column 'foreclosure_hi_med_low' to the dataframe
-train_data_3$foreclosure_hi_med_low <- cut(train_data_3$foreclosure_pc_2020,
-                                         breaks = quantile(train_data$foreclosure_pc_2020, probs = c(0, 1/3, 2/3, 1)),
-                                         labels = c(1, 2, 3),
-                                         include.lowest = TRUE)
+# Subsetting data with only selected variables
+selected_train_data_2 <- train_data_2[c(independent_variables, "foreclosure_hi_med_low")]
+selected_test_data_2 <- test_data_2[c(independent_variables, "foreclosure_hi_med_low")]
 
-# Convert the new column to factor
-train_data_3$foreclosure_hi_med_low <- as.factor(train_data_3$foreclosure_hi_med_low)
-
-# Train SVM model with Polynomial kernel for classification
-svm_model_poly_classification <- svm(foreclosure_hi_med_low ~ ., data = train_data_3, kernel = "polynomial")
+# Train SVM model for classification with RBF kernel
+svm_model_classification_rbf <- svm(foreclosure_hi_med_low ~ ., data = selected_train_data_2, kernel = "radial")
 
 # Predictions on test set
-predictions_poly_classification <- predict(svm_model_poly_classification, test_data_3)
+predictions_classification_rbf <- predict(svm_model_classification_rbf, selected_test_data_2)
 
 # Evaluate classification performance
-confusionMatrix(predictions_poly_classification, test_data_3$foreclosure_hi_med_low)
+conf_matrix_rbf <- confusionMatrix(predictions_classification_rbf, selected_test_data_2$foreclosure_hi_med_low)
+
+# Calculate precision, recall, specificity, and F1 measure for each class
+precision_rbf <- diag(conf_matrix_rbf$table) / colSums(conf_matrix_rbf$table)
+recall_rbf <- diag(conf_matrix_rbf$table) / rowSums(conf_matrix_rbf$table)
+specificity_rbf <- diag(conf_matrix_rbf$table[2:3, 2:3]) / colSums(conf_matrix_rbf$table[2:3, 2:3])
+f1_measure_rbf <- 2 * (precision_rbf * recall_rbf) / (precision_rbf + recall_rbf)
+
+# Print the confusion matrix
+print(conf_matrix_rbf)
+
+# Print precision, recall, specificity, and F1 measure for each class
+cat("\nPrecision:\n", precision_rbf, "\n")
+cat("Recall:\n", recall_rbf, "\n")
+cat("Specificity:\n", specificity_rbf, "\n")
+cat("F1 Measure:\n", f1_measure_rbf, "\n")
+
+```
+Overall, this model is less accurate than the model with the linear kernel.
+
+SVM classification model with polynomial kernel;
+```{r}
+# Train SVM model for classification with polynomial kernel
+svm_model_classification_poly <- svm(foreclosure_hi_med_low ~ ., data = selected_train_data_2, kernel = "polynomial")
+
+# Predictions on test set
+predictions_classification_poly <- predict(svm_model_classification_poly, selected_test_data_2)
+
+# Evaluate classification performance
+conf_matrix_poly <- confusionMatrix(predictions_classification_poly, selected_test_data_2$foreclosure_hi_med_low)
+
+# Calculate precision, recall, specificity, and F1 measure for each class
+precision_poly <- diag(conf_matrix_poly$table) / colSums(conf_matrix_poly$table)
+recall_poly <- diag(conf_matrix_poly$table) / rowSums(conf_matrix_poly$table)
+specificity_poly <- diag(conf_matrix_poly$table[2:3, 2:3]) / colSums(conf_matrix_poly$table[2:3, 2:3])
+f1_measure_poly <- 2 * (precision_poly * recall_poly) / (precision_poly + recall_poly)
+
+# Print the confusion matrix
+print(conf_matrix_poly)
+
+# Print precision, recall, specificity, and F1 measure for each class
+cat("\nPrecision:\n", precision_poly, "\n")
+cat("Recall:\n", recall_poly, "\n")
+cat("Specificity:\n", specificity_poly, "\n")
+cat("F1 Measure:\n", f1_measure_poly, "\n")
+
 ```
 
 
