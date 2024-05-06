@@ -377,12 +377,13 @@ cat("Specificity:\n", specificity_poly, "\n")
 cat("F1 Measure:\n", f1_measure_poly, "\n")
 
 ```
+While this model is slightly more accurate than the model with the RBF kernel, it is less accurate in all quantiles than the model with the linear kernel. 
 
 
-Neural Networks:
 
+**NEURAL NETWORKS**
 
-Test Neural Networks:
+We test Neural Networks with multiple configurations (i.e. activaion functions, number of hidden layers, numbers of neurons per layer):
   
 ```{r}
 # Select the list of independent variables and the dependent variable
@@ -402,12 +403,13 @@ independent_variables <- c(
   "medincome_change_2015_2020", "medincome_change_2010_2020", "pop_change_pct"
 )
 
+# Scale from 0-1
 min_max_scaling <- function(x) {
   (x - min(x)) / (max(x) - min(x))
 }
 
 # Extract the selected columns from the dataframe
-selected_data <- pg_foreclosures_per_tract[independent_variables]
+selected_data <- pg_foreclosures_per_tract[independent_variables]S
 
 # Normalize the selected columns
 selected_data_normalized <- selected_data
@@ -485,9 +487,10 @@ best_config <- configurations[[which.min(sapply(results, function(x) x$rmse))]]
 # Train the best model with the identified configuration
 best_model <- train_nn_model(best_config$hidden_layers, best_config$neurons_per_layer, best_config$activation_function, train_data_4 = train_data_4, test_data_4 = test_data_4)
 ```
+The best-performing NN is configuration 7, plotted here:
 
 ```{r}
-plot(best_model$model)
+plot(best_model$model, cex = 0.8) 
 ```
 
 
