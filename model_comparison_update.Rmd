@@ -1,0 +1,227 @@
+---
+title: "model comparison"
+output: html_document
+date: "2024-05-01"
+---
+
+Here is the generation of the random forest
+```{r}
+random_forest = randomForest(as.factor(train_data$ranges)~.,data = train_data,ntree = 4,importance = T, na.action=na.exclude)
+summary(random_forest)
+```
+
+Here is the generation of the decision tree:
+```{r}
+training$ranges<-as.factor(training$ranges)
+
+modelDT <-C5.0(training[43], training$ranges)
+summary(model)
+predict <- predict(model,testing)
+CrossTable(testing$ranges,	predict,prop.chisq=FALSE, prop.c=FALSE,	prop.r=	FALSE,	
+           dnn	=	c('actual',	'predicted'))
+summary(predict)
+```
+
+```{r}
+pg_foreclosures_per_tract <- read_csv("datasets/pg_foreclosures_per_tract.csv", guess_max=173)
+# Step 1: Data Preprocessing
+# Set seed for reproducibility
+set.seed(123)
+
+# Randomly sample row indices for the training set
+train_index <- sample(nrow(pg_foreclosures_per_tract), 0.8 * nrow(pg_foreclosures_per_tract))
+
+# Create training and testing datasets
+train_data <- pg_foreclosures_per_tract[train_index, ]
+test_data <- pg_foreclosures_per_tract[-train_index, ]
+
+# Step 2: Model Training
+svm_model <- svm(foreclosure_pc_2020 ~ ., data = train_data, kernel = "linear")
+
+# Step 3: Model Evaluation
+# Predictions on test set
+predictionsSVM <- predict(svm_model, test_data)
+summary(predictions)
+# Calculate evaluation metrics
+#mse <- mean((test_data$foreclosure_pc_2020 - predictions)^2)
+#rmse <- sqrt(mse)
+#rsquared <- cor(predictions, test_data$foreclosure_pc_2020)^2
+
+# Print evaluation metrics
+#print(paste("Mean Squared Error (MSE):", mse))
+#print(paste("Root Mean Squared Error (RMSE):", rmse))
+#print(paste("R-squared (R²):", rsquared))
+
+
+```
+THis is how we set up the random forests
+```{r}
+train <- sample(nrow(pg_fc_pt), 0.7 * nrow(pg_fc_pt), 
+                replace = FALSE) 
+train_data <- pg_fc_pt[train, ] 
+test_data <- pg_fc_pt[-train, ] 
+
+pg_fc_pt$ranges = factor(pg_fc_pt$ranges)
+
+# training
+random_forest = randomForest(as.factor(train_data$ranges)~.,data = train_data,ntree = 4,importance = T, na.action=na.exclude)
+  
+# predictions about the test data 
+predictions <- predict(random_forest, test_data) 
+
+# identifying features with high importance
+importance_scores <- importance(random_forest)  
+
+# we used this function to ascertain the model's accuracy.
+accuracy <- sum(predictions == test_data$ranges) / nrow(test_data) 
+print(paste("Accuracy:", round(accuracy, 2))) 
+print(importance_scores)
+```
+
+here is how we can run neural networks
+```{r}
+# Select the list of independent variables and the dependent variable
+independent_variables <- c(
+  "avg_bed", "tract_homevalue_2020", "tract_medage_2020", "tract_medincome_2020", 
+  "tract_medincome_2010", "foreclosure_pc_2010", "pct_built_2020_later", 
+  "pct_built_2010_2019", "pct_built_2000_2009", "pct_built_1990_1999", 
+  "pct_built_1980_1989", "pct_built_1970_1979", "pct_built_pre_1960", 
+  "pct_0_bd", "pct_1_bd", "pct_2_bd", "pct_3_bd", "pct_4_more_bd", 
+  "poverty_2010", "poverty_2020", "nhwhite_2010", "nhwhite_2020", 
+  "mortgaged_2010", "mortgaged_2015", "mortgaged_2020", "ownoccupied_2010", 
+  "ownoccupied_2015", "ownoccupied_2020", "mortgage_change_2010_2015", 
+  "mortgage_change_2015_2020", "mortgage_change_2010_2020", 
+  "ownoccupied_change_2010_2015", "ownoccupied_change_2015_2020", 
+  "ownoccupied_change_2010_2020", "poverty_change_2010_2020", 
+  "nhwhite_change_2010_2020", "medincome_change_2010_2015", 
+  "medincome_change_2015_2020", "medincome_change_2010_2020", "pop_change_pct"
+)
+
+min_max_scaling <- function(x) {
+  (x - min(x)) / (max(x) - min(x))
+}
+
+# Extract the selected columns from the dataframe
+selected_data <- pg_foreclosures_per_tract[independent_variables]
+
+# Normalize the selected columns
+selected_data_normalized <- selected_data
+selected_data_normalized[] <- lapply(selected_data, min_max_scaling)
+
+# Add foreclosure_pc_2020 to the normalized dataframe
+selected_data_normalized$foreclosure_pc_2020 <- min_max_scaling(pg_foreclosures_per_tract$foreclosure_pc_2020)
+
+# Split data into training and testing sets
+set.seed(123)
+train_index <- createDataPartition(selected_data_normalized$foreclosure_pc_2020, p = 0.8, list = FALSE)
+train_data <- selected_data_normalized[train_index, ]
+test_data <- selected_data_normalized[-train_index, ]
+
+# Define configurations to test
+configurations <- list(
+  list(hidden_layers = 1, neurons_per_layer = c(10), activation_function = "logistic"),
+  list(hidden_layers = 2, neurons_per_layer = c(10, 5), activation_function = "tanh")
+  # Add more configurations as needed
+)
+
+# Function to build and train neural network model
+train_nn_model <- function(hidden_layers, neurons_per_layer, activation_function, train_data, test_data) {
+  # Build neural network model
+  model <- neuralnet(
+    foreclosure_pc_2020 ~ .,
+    data = train_data,  # Use normalized training data
+    hidden = neurons_per_layer,
+    linear.output = TRUE,  # For regression tasks
+    act.fct = activation_function
+  )
+  
+  # Make predictions on test data
+  predictions <- predict(model, test_data)
+  
+  # Calculate evaluation metrics (e.g., RMSE)
+  rmse <- sqrt(mean((test_data$foreclosure_pc_2020 - predictions)^2))
+  
+  # Return performance results
+  return(list(
+    rmse = rmse,
+    activation_function = activation_function,
+    hidden_layers = hidden_layers,
+    neurons_per_layer = neurons_per_layer
+  ))
+}
+
+# Evaluate neural network models for each configuration
+results <- lapply(configurations, function(config) {
+  train_nn_model(config$hidden_layers, config$neurons_per_layer, config$activation_function, train_data, test_data)
+})
+
+
+# Report results
+for (i in seq_along(results)) {
+  cat("Configuration:", i, "\n")
+  cat("RMSE:", results[[i]]$rmse, "\n")
+  cat("Activation Function:", results[[i]]$activation_function, "\n")
+  cat("Hidden Layers:", results[[i]]$hidden_layers, "\n")
+  cat("Neurons per Layer:", results[[i]]$neurons_per_layer, "\n\n")
+}
+
+# Identify the best configuration based on performance metrics
+best_config <- configurations[[which.min(sapply(results, function(x) x$rmse))]]
+
+# Train the best model with the identified configuration
+best_model <- train_nn_model(best_config$hidden_layers, best_config$neurons_per_layer, best_config$activation_function, train_data = train_data, test_data = test_data)
+# Report results
+for (i in seq_along(results)) {
+  cat("Configuration:", i, "\n")
+  cat("RMSE:", results[[i]]$rmse, "\n")
+  cat("Activation Function:", results[[i]]$activation_function, "\n")
+  cat("Hidden Layers:", results[[i]]$hidden_layers, "\n")
+  cat("Neurons per Layer:", results[[i]]$neurons_per_layer, "\n\n")
+}
+
+# Identify the best configuration based on performance metrics
+best_config <- configurations[[which.min(sapply(results, function(x) x$rmse))]]
+
+# Train the best model with the identified configuration
+best_model <- train_nn_model(best_config$hidden_layers, best_config$neurons_per_layer, best_config$activation_function, train_data = train_data, test_data = test_data)
+```
+
+
+here is how we can get the data into a model comparison:
+```{r}
+#results <- resamples(list(RF=random_forest, DT=modelDT, SVM=svm_model_poly))
+train_data <- read.csv("train_data.csv")
+install.packages("caret")
+library(caret)
+install.packages("e1071")
+library(e1071)
+install.packages("randomForest")
+library(randomForest)
+#Crossvalidation method for resampling 
+ctrl <- trainControl(method = "cv", number = 10) 
+# Train the model with trControl
+
+train_data$foreclosure_pc_2020_binary <- ifelse(train_data$foreclosure_pc_2020 < 0.5, 0, 1)
+train_data$foreclosure_pc_2020_binary <- as.factor(train_data$foreclosure_pc_2020_binary)
+
+train_data <- subset(train_data, select = -foreclosure_pc_2020)
+
+# Train the SVM model
+svm_model <- train(foreclosure_pc_2020_binary ~ ., data = train_data, kernel = "radial",trControl = ctrl)
+random_forest <- train(foreclosure_pc_2020_binary ~ ., data = train_data,method = "rf", trControl = ctrl)
+neural_network <- train( foreclosure_pc_2020_binary ~ ., data = train_data,linear.output = TRUE, act.fct = "logistic", trControl = ctrl)
+decision_tree <- train(foreclosure_pc_2020_binary ~ ., data = train_data, trControl = ctrl)
+# Pass the control object to resamples
+
+results <- resamples(list(RF = random_forest, SVM = svm_model, NN = neural_network, DT = decision_tree))
+
+
+# summarize the distributions
+summary(results)
+# boxplots of results
+bwplot(results)
+# dot plots of results
+dotplot(results)
+```
+
+
