@@ -1,0 +1,45 @@
+---
+title: "model comparison"
+output: html_document
+date: "2024-05-01"
+author: "Krehl Kasayan"
+---
+
+here is how we can get the data into a model comparison:
+```{r}
+#results <- resamples(list(RF=random_forest, DT=modelDT, SVM=svm_model_poly))
+train_data <- read.csv("train_data.csv")
+install.packages("caret")
+library(caret)
+install.packages("e1071")
+library(e1071)
+install.packages("randomForest")
+library(randomForest)
+#Crossvalidation method for resampling 
+ctrl <- trainControl(method = "cv", number = 10) 
+# Train the model with trControl
+
+train_data$foreclosure_pc_2020_binary <- ifelse(train_data$foreclosure_pc_2020 < 0.5, 0, 1)
+train_data$foreclosure_pc_2020_binary <- as.factor(train_data$foreclosure_pc_2020_binary)
+
+train_data <- subset(train_data, select = -foreclosure_pc_2020)
+
+# Train the SVM model
+svm_model <- train(foreclosure_pc_2020_binary ~ ., data = train_data, kernel = "radial",trControl = ctrl)
+random_forest <- train(foreclosure_pc_2020_binary ~ ., data = train_data,method = "rf", trControl = ctrl)
+neural_network <- train( foreclosure_pc_2020_binary ~ ., data = train_data,linear.output = TRUE, act.fct = "logistic", trControl = ctrl)
+decision_tree <- train(foreclosure_pc_2020_binary ~ ., data = train_data, trControl = ctrl)
+# Pass the control object to resamples
+
+results <- resamples(list(RF = random_forest, SVM = svm_model, NN = neural_network, DT = decision_tree))
+
+
+# summarize the distributions
+summary(results)
+# boxplots of results
+bwplot(results)
+# dot plots of results
+dotplot(results)
+```
+
+
