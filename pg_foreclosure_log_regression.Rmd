@@ -289,11 +289,6 @@ text(x = max(as.numeric(predicted_values)),
      y = min(test_data$foreclosure_quantile), 
      labels = paste("Correlation:", round(correlation, 2)), pos = 2)
 
-# Close the jpeg device to save the plot
-dev.off()
-
-# Show the plot in Markdown
-knitr::include_graphics("correlation_plot_log_reg_model_1.jpg")
 ```
 A correlation coefficient of 0.82 is not bad, but we are only dealing with five quantiles - we could use a better sense of how accurate this model is.
 
@@ -349,11 +344,6 @@ text(x = max(as.numeric(predicted_values)),
      y = min(test_data$foreclosure_quantile), 
      labels = paste("Correlation:", round(correlation, 2)), pos = 2)
 
-# Close the jpeg device to save the plot
-dev.off()
-
-# Show the plot in Markdown
-knitr::include_graphics("correlation_plot_log_reg_model_6.jpg")
 ```
 That model is, for some reason, better at predicting quantiles than our initial model.
 

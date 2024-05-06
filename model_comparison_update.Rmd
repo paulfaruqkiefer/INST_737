@@ -54,7 +54,7 @@ summary(predictions)
 
 
 ```
-THis is how we set up the random forests
+Tis is how we set up the random forests
 ```{r}
 train <- sample(nrow(pg_fc_pt), 0.7 * nrow(pg_fc_pt), 
                 replace = FALSE) 

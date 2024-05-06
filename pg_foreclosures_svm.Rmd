@@ -1,6 +1,6 @@
 ---
 title: "pg_foreclosure_svm"
-author: "Paul Kiefer"
+author: "Paul Kiefer, Krehl Kasayan"
 date: "2024-04-29"
 output: html_document
 ---
@@ -113,7 +113,6 @@ rsquared <- cor(predictions, test_data_1[[dependent_variable]])^2
 print(paste("Mean Squared Error (MSE):", mse))
 print(paste("Root Mean Squared Error (RMSE):", rmse))
 print(paste("R-squared (R²):", rsquared))
-
 ```
 
 To test the significance of that RSME, we can compare it to the standard deviation of the dependent variable.
@@ -383,7 +382,7 @@ While this model is slightly more accurate than the model with the RBF kernel, i
 
 **NEURAL NETWORKS**
 
-We test Neural Networks with multiple configurations (i.e. activaion functions, number of hidden layers, numbers of neurons per layer):
+We test Neural Networks with 10 multiple configurations (i.e. activaion functions, number of hidden layers, numbers of neurons per layer):
   
 ```{r}
 # Select the list of independent variables and the dependent variable
@@ -409,7 +408,7 @@ min_max_scaling <- function(x) {
 }
 
 # Extract the selected columns from the dataframe
-selected_data <- pg_foreclosures_per_tract[independent_variables]S
+selected_data <- pg_foreclosures_per_tract[independent_variables]
 
 # Normalize the selected columns
 selected_data_normalized <- selected_data
@@ -487,17 +486,18 @@ best_config <- configurations[[which.min(sapply(results, function(x) x$rmse))]]
 # Train the best model with the identified configuration
 best_model <- train_nn_model(best_config$hidden_layers, best_config$neurons_per_layer, best_config$activation_function, train_data_4 = train_data_4, test_data_4 = test_data_4)
 ```
-The best-performing NN is configuration 7, plotted here:
+The best-performing NN is configuration 7, plotted here.
 
 ```{r}
 plot(best_model$model, cex = 0.8) 
 ```
 
+**FEATURE SELECTION**
+
+We apply step and RFE feature selection on three relatively inaccurate models:
 
 
-Feature selection:
-
-SVM
+1. Regression SVM with linear kernel and feature selection using the filter method:
 
 ```{r}
 # Step 1: Data Preprocessing
@@ -524,62 +524,67 @@ dependent_variable <- "foreclosure_pc_2020"
 # Subsetting data
 selected_data <- pg_foreclosures_per_tract[c(independent_variables, dependent_variable)]
 
-# Splitting data
-train_index <- sample(nrow(selected_data), 0.8 * nrow(selected_data))
-train_data_1 <- selected_data[train_index, ]
-test_data_1 <- selected_data[-train_index, ]
+# Calculate correlations between independent variables and dependent variable
+correlations <- cor(selected_data[independent_variables], selected_data[[dependent_variable]])
+
+# Get the names of the variables from the correlation matrix
+variable_names <- rownames(correlations)
+
+# Sort the correlations matrix by absolute values
+sorted_correlations <- sort(abs(correlations), decreasing = TRUE, index.return = TRUE)
+
+# Extract the row names of the top N variables
+N <- 10  # Number of top variables to select
+top_indices <- sorted_correlations$ix[1:N]
+most_predictive_variables <- rownames(correlations)[top_indices]
+
+# Calculate VIF for each variable
+library(car)
+vif_results <- vif(lm(selected_data[, most_predictive_variables]))
+
+# Identify variables with VIF values over 10
+high_vif_variables <- names(vif_results[vif_results > 10])
+
+
+# Calculate correlation coefficients w/ the high VIF variables and the dependent variable
+correlation_with_foreclosure <- sapply(high_vif_variables, function(var) {
+  cor(pg_foreclosures_per_tract[[var]], pg_foreclosures_per_tract[[dependent_variable]])
+})
+
+# Find the variable with the highest absolute correlation coefficient
+most_correlated_variable_high_vif <- high_vif_variables[which.max(abs(correlation_with_foreclosure))]
+
+# Drop variables from high_vif_variables from most_predictive_variables
+most_predictive_variables <- setdiff(most_predictive_variables, high_vif_variables)
+
+# Add most_correlated_variable_high_vif to most_predictive_variables
+most_predictive_variables <- c(most_predictive_variables, most_correlated_variable_high_vif)
+
+# Subsetting data after feature selection
+train_data_filtered <- pg_foreclosures_per_tract[train_index, ]
+test_data_filtered <- pg_foreclosures_per_tract[-train_index, ]
 
 # Step 2: Model Training
-base_model <- lm(foreclosure_pc_2020 ~ 1, data = train_data_1) # Intercept-only model
-full_model <- lm(foreclosure_pc_2020 ~ ., data = train_data_1) # Full model
+svm_model <- svm(as.formula(paste(dependent_variable, "~ .")), data = train_data_filtered, kernel ="linear")
 
-# Step 3: Perform step-wise algorithm
-step_model <- step(base_model, scope = list(lower = base_model, upper = full_model), direction = "both", trace = 0)
+# Step 3: Model Evaluation
+predictions <- predict(svm_model, test_data_filtered)
 
-# Get selected variables
-selected_variables_2 <- attr(terms(step_model), "term.labels")
+# Calculate evaluation metrics
+mse <- mean((test_data_filtered[[dependent_variable]] - predictions)^2)
+rmse <- sqrt(mse)
+rsquared <- cor(predictions, test_data_filtered[[dependent_variable]])^2
 
-# Step 4: Model Evaluation
-predictions <- predict(step_model, newdata = test_data_1)
-
-# Calculate evaluation metrics for base model
-base_mse <- mean((test_data_1[[dependent_variable]] - predict(base_model, newdata = test_data_1))^2)
-base_rmse <- sqrt(base_mse)
-base_rsquared <- cor(predict(base_model, newdata = test_data_1), test_data_1[[dependent_variable]])^2
-
-# Calculate evaluation metrics for final model
-final_mse <- mean((test_data_1[[dependent_variable]] - predictions)^2)
-final_rmse <- sqrt(final_mse)
-final_rsquared <- cor(predictions, test_data_1[[dependent_variable]])^2
-
-# Print performance comparison
-print("Performance comparison:")
-print(paste("Base Model - Mean Squared Error (MSE):", base_mse))
-print(paste("Final Model - Mean Squared Error (MSE):", final_mse))
-print(paste("Improvement in MSE:", base_mse - final_mse))
-print(paste("Base Model - Root Mean Squared Error (RMSE):", base_rmse))
-print(paste("Final Model - Root Mean Squared Error (RMSE):", final_rmse))
-print(paste("Improvement in RMSE:", base_rmse - final_rmse))
-
-# Print R-squared comparison if applicable
-if (!is.na(base_rsquared)) {
-  print(paste("Base Model - R-squared (R²):", base_rsquared))
-}
-print(paste("Final Model - R-squared (R²):", final_rsquared))
-if (!is.na(base_rsquared)) {
-  print(paste("Improvement in R-squared (R²):", final_rsquared - base_rsquared))
-} else {
-  print("R-squared comparison not applicable for the base model.")
-}
-
-# Print selected variables
-print("Selected variables in the final model:")
-print(selected_variables_2)
+# Print evaluation metrics
+print(paste("Mean Squared Error (MSE):", mse))
+print(paste("Root Mean Squared Error (RMSE):", rmse))
+print(paste("R-squared (R²):", rsquared))
 
 ```
+Applying filter feature selection -- albeit in this (possibly) unnecessarily complicated way -- drastically improves the predictiveness of the regression SVM by selecting only six of the 40 independent variables to train the model. 
 
 
-Naive Bayes
+2. Naive Bayes model using the wrapper method of feature selection (stepwise function):
 ```{r}
 # Convert foreclosure_quantile to a factor with ordered levels
 pg_foreclosures_per_tract_log_reg$foreclosure_quantile <- factor(
@@ -632,113 +637,55 @@ confusion_matrix <- confusionMatrix(predictions, test_data_2$foreclosure_quantil
 print(confusion_matrix)
 
 ```
+After applying the stepwise function for feature selection, our Naive Bayes model is actually less accurate than the original Naive Bayes model from Milestone 2, albeit only by roughly 3 percent. The original model more accurately predicted Class 5 (the highest foreclosure rate per capita) than this model with feature selection. 
 
 
 
+3. Multivariate Linear Regression updated with embedded feature selection (L2 regularization)
 ```{r}
-# Define test variables
-test_variables_3 <- c("mortgaged_2010", "tract_homevalue_2020", "tract_medage_2020", "tract_medincome_2020", 
-                      "foreclosure_pc_2010", "pct_built_2000_2009", "poverty_2010", "nhwhite_2020", 
-                      "mortgage_change_2010_2020", "poverty_change_2010_2020", "nhwhite_change_2010_2020",
-                      "medincome_change_2010_2015", "medincome_change_2015_2020", "medincome_change_2010_2020", 
-                      "pop_change_pct")
+library(caret)
+library(glmnet)
+
+variables_of_interest <- c("avg_bed", "tract_homevalue_2020", "tract_medage_2020", "tract_medincome_2020", 
+                            "tract_medincome_2010", "foreclosure_pc_2010", 
+                            "pct_built_2020_later", "pct_built_2010_2019", "pct_built_2000_2009", 
+                            "pct_built_1990_1999", "pct_built_1980_1989", "pct_built_1970_1979", 
+                            "pct_built_pre_1960", "pct_0_bd", "pct_1_bd", "pct_2_bd", "pct_3_bd", 
+                            "pct_4_more_bd", "poverty_2010", "poverty_2020", "nhwhite_2010", "nhwhite_2020", 
+                            "mortgaged_2010", "mortgaged_2015", "mortgaged_2020", "ownoccupied_2010", 
+                            "ownoccupied_2015", "ownoccupied_2020", "mortgage_change_2010_2015", 
+                            "mortgage_change_2015_2020", "mortgage_change_2010_2020","ownoccupied_change_2010_2015",                             "ownoccupied_change_2015_2020", "ownoccupied_change_2010_2020",
+                            "poverty_change_2010_2020","nhwhite_change_2010_2020","medincome_change_2010_2015",
+                            "medincome_change_2015_2020", "medincome_change_2010_2020", "pop_change_pct")
 
 # Split the data into training and testing sets
 set.seed(123) # for reproducibility
-train_indices <- createDataPartition(pg_foreclosures_per_tract$foreclosure_pc_2020, p = 0.8, list = FALSE)
-train_data_6 <- pg_foreclosures_per_tract[train_indices, ]
-test_data_6 <- pg_foreclosures_per_tract[-train_indices, ]
+train_indices <- createDataPartition(train_data_6$foreclosure_pc_2020, p = 0.8, list = FALSE)
+train_data <- train_data_6[train_indices, ]
+test_data <- train_data_6[-train_indices, ]
 
-# Define control parameters for RFE
-ctrl <- rfeControl(functions = lmFuncs, method = "cv", number = 10)
-
-# Perform RFE on new training data excluding tract_number
-lm_model_rfe <- rfe(x = train_data_6[, test_variables_3], 
-                    y = train_data_6$foreclosure_pc_2020, 
-                    sizes = c(1:15), 
-                    rfeControl = ctrl)
-
-# Extract the selected features
-selected_features <- predictors(lm_model_rfe)
-
-# Train the linear regression model on the new training data with selected features
-lm_model_selected <- lm(foreclosure_pc_2020 ~ . - 1, data = train_data_6[, c("foreclosure_pc_2020", selected_features)])
+# Train the Ridge regression model on the training data with selected features
+ridge_model <- glmnet(x = as.matrix(train_data[, variables_of_interest]), 
+                      y = train_data$foreclosure_pc_2020, 
+                      alpha = 0, # Ridge regression (L2 regularization)
+                      lambda = 1) # Regularization parameter, can be tuned using cross-validation
 
 # Use the trained model to predict on the testing data with selected features
-predicted_values_selected <- predict(lm_model_selected, newdata = test_data_6[, c(selected_features)])
+predicted_values <- predict(ridge_model, newx = as.matrix(test_data[, variables_of_interest]))
 
-# Calculate the correlation between the predicted and real values with selected features
-correlation_selected <- cor(predicted_values_selected, test_data_6$foreclosure_pc_2020)
+# Calculate the correlation between the predicted and real values
+correlation <- cor(predicted_values, test_data$foreclosure_pc_2020)
 
-# Calculate the mean squared error between the predicted and real values with selected features
-mse_selected <- mean((predicted_values_selected - test_data_6$foreclosure_pc_2020)^2)
+# Calculate the mean squared error between the predicted and real values
+mse <- mean((predicted_values - test_data$foreclosure_pc_2020)^2)
 
-# Obtain coefficients for each selected feature
-coefficients_selected <- coef(lm_model_selected)
-print(coefficients_selected)
-
-# Print the selected features, correlation, and mean squared error
-cat("Selected features:", selected_features, "\n")
-cat("Correlation between predicted and real values with selected features:", correlation_selected, "\n")
-cat("Mean Squared Error with selected features:", mse_selected, "\n")
-
+# Print the correlation and mean squared error
+cat("Correlation between predicted and real values:", correlation, "\n")
+cat("Mean Squared Error:", mse, "\n")
 ```
-```{r}
-# Define independent variables
-independent_variables <- c(
-  "avg_bed", "tract_homevalue_2020", "tract_medage_2020", "tract_medincome_2020", 
-  "tract_medincome_2010", "foreclosure_pc_2010", "pct_built_2020_later", 
-  "pct_built_2010_2019", "pct_built_2000_2009", "pct_built_1990_1999", 
-  "pct_built_1980_1989", "pct_built_1970_1979", "pct_built_pre_1960", 
-  "pct_0_bd", "pct_1_bd", "pct_2_bd", "pct_3_bd", "pct_4_more_bd", 
-  "poverty_2010", "poverty_2020", "nhwhite_2010", "nhwhite_2020", 
-  "mortgaged_2010", "mortgaged_2015", "mortgaged_2020", "ownoccupied_2010", 
-  "ownoccupied_2015", "ownoccupied_2020", "mortgage_change_2010_2015", 
-  "mortgage_change_2015_2020", "mortgage_change_2010_2020", 
-  "ownoccupied_change_2010_2015", "ownoccupied_change_2015_2020", 
-  "ownoccupied_change_2010_2020", "poverty_change_2010_2020", 
-  "nhwhite_change_2010_2020", "medincome_change_2010_2015", 
-  "medincome_change_2015_2020", "medincome_change_2010_2020", "pop_change_pct"
-)
+The linear regression model with all of our independent variables is modestly more predictive after undergoing L2 regularization (i.e. updated with Ridge regression). The previous version of this model had the following output: 
 
-# Split the data into training and testing sets
-set.seed(123) # for reproducibility
-train_indices <- createDataPartition(pg_foreclosures_per_tract$foreclosure_pc_2020, p = 0.8, list = FALSE)
-train_data_7 <- pg_foreclosures_per_tract[train_indices, ]
-test_data_7 <- pg_foreclosures_per_tract[-train_indices, ]
+Correlation between predicted and real values: 0.7934256 
+Mean Squared Error: 437.2731 
 
-# Define control parameters for RFE
-ctrl <- rfeControl(functions = lmFuncs, method = "cv", number = 10)
-
-# Perform RFE on new training data using independent_variables
-lm_model_rfe <- rfe(x = train_data_7[, independent_variables], 
-                    y = train_data_7$foreclosure_pc_2020, 
-                    sizes = c(1:15), 
-                    rfeControl = ctrl)
-
-# Extract the selected features
-selected_features <- predictors(lm_model_rfe)
-
-# Train the linear regression model on the new training data with selected features
-lm_model_selected <- lm(foreclosure_pc_2020 ~ . - 1, data = train_data_7[, c("foreclosure_pc_2020", selected_features)])
-
-# Use the trained model to predict on the testing data with selected features
-predicted_values_selected <- predict(lm_model_selected, newdata = test_data_7[, c(selected_features)])
-
-# Calculate the correlation between the predicted and real values with selected features
-correlation_selected <- cor(predicted_values_selected, test_data_7$foreclosure_pc_2020)
-
-# Calculate the mean squared error between the predicted and real values with selected features
-mse_selected <- mean((predicted_values_selected - test_data_7$foreclosure_pc_2020)^2)
-
-# Obtain coefficients for each selected feature
-coefficients_selected <- coef(lm_model_selected)
-print(coefficients_selected)
-
-# Print the selected features, correlation, and mean squared error
-cat("Selected features:", selected_features, "\n")
-cat("Correlation between predicted and real values with selected features:", correlation_selected, "\n")
-cat("Mean Squared Error with selected features:", mse_selected, "\n")
-
-```
-
+In other words, the correlation between the predicted and real values increased by just over 5 percent, though the MSE decreased more substantially.
